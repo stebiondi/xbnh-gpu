@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Quick tests, a few minutes on any recent GPU:
-#   1. rip-channel beach (16k cells, 120 s, ts_nonh boundary, wall back, Neumann laterals): fp64 and fp32,
+#   1. rip-channel beach (39k cells, 120 s, ts_nonh boundary, wall back, Neumann laterals): fp64 and fp32,
 #   2. Estero-feature deck (40k cells, 100 s: cyclic laterals, abs_2d back, vector U/V/Z boundary, tide
 #      file, wind file, point output).
 # When the reference XBeach is built (install.sh --with-xbeach), the same decks also run in Fortran XBeach
@@ -26,7 +26,7 @@ for b in xbnh_gpu xbnh_gpu_sp; do
 done
 
 echo "== 1. rip-channel beach"
-python "$ROOT/examples/rip_beach/make_case.py" "$W/rip_deck" --ny 60 --tstop 120 --tintg 1 > /dev/null
+python "$ROOT/examples/rip_beach/make_case.py" "$W/rip_deck" --ny 150 --tstop 120 --tintg 1 > /dev/null
 rungpu "$W/rip_deck" "$W/rip_gpu" xbnh_gpu; result $?
 rungpu "$W/rip_deck" "$W/rip_gpu_sp" xbnh_gpu_sp; result $?
 echo " fp32 against fp64"

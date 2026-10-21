@@ -240,7 +240,7 @@ output only. The two patches are:
 
 \code{tests/run\_tests.sh} runs two small decks on the GPU in both precisions:
 \begin{itemize}
-\item a rip-channel beach (16\,k cells, 120\,s);
+\item a rip-channel beach (39\,k cells, 120\,s);
 \item the Estero-feature deck (40\,k cells, 100\,s; cyclic laterals, \code{abs\_2d}, vector boundary,
       tide and wind files, point output).
 \end{itemize}
@@ -248,6 +248,20 @@ When the reference XBeach exists, the same decks run in Fortran XBeach and the a
 against thresholds. Otherwise the GPU statistics are checked against values stored in
 \code{tests/reference.json}. The thresholds are several times the differences that XBeach itself shows
 between rank counts.
+The tests take two to five minutes. A passing run with the reference XBeach ends like this (the numbers
+are from the RTX~2000 Ada):
+\begin{lstlisting}
+ Fortran XBeach (serial) against GPU
+   Hs_rel          0.0014  (limit 0.01)  ok
+   current_rel     0.0045  (limit 0.03)  ok
+   zs_rms_m        0.0027  (limit 0.01)  ok
+ ...
+ Fortran XBeach (MPI, 2 ranks) against GPU
+   Hs_rel          0.0032  (limit 0.02)  ok
+   current_rel     0.0046  (limit 0.1)  ok
+   zs_rms_m        0.0029  (limit 0.02)  ok
+tests passed: 6, failed: 0
+\end{lstlisting}
 
 %=====================================================================================================
 \section{Validation}
