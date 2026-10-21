@@ -4,6 +4,7 @@ Pass/fail checks used by run_tests.sh.
   check.py rip <ref dir> <test dir>      rip-beach agreement (tools/compare_rip.py metrics)
   check.py fields <ref dir> <test dir>   Estero-feature agreement (tools/compare_fields.py metrics)
   check.py ref <rip|est> <test dir>      GPU statistics against tests/reference.json (no XBeach needed)
+  check.py hotstart <run dir> <restart dir>   state written by writehotstart is read back by hotstart = 1
 
 Thresholds are several times the differences found between XBeach builds and rank counts (see the guide),
 so a pass means the GPU code reproduces XBeach, not that the two are identical.
@@ -69,6 +70,23 @@ def main():
         m = metrics("compare_fields.py", sys.argv[2], sys.argv[3], 40)
         vals = {"Hs_rel": m["Hs_map"]["rel_rmse"], "current_rel": m["mean_current"]["rel_rmse"], "zs_rms_m": m["zs_field"]["rms_diff"]}
         ok = report(vals, LIMITS["fields"])
+    elif mode == "hotstart":
+        # last global record of the writing run against the first record of the run restarted from it
+        a, b = Path(sys.argv[2]), Path(sys.argv[3])
+        p = {}
+        for line in (a / "params.txt").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("%")[0].split("=", 1)
+                p[k.strip().lower()] = v.strip()
+        n = (int(p["nx"]) + 1) * (int(p["ny"]) + 1)
+        ok = True
+        for v in ["zs", "uu", "vv"]:
+            x = np.fromfile(a / f"{v}.dat", "<f8").reshape(-1, n)[-1]
+            y = np.fromfile(b / f"{v}.dat", "<f8").reshape(-1, n)[0]
+            d = float(np.abs(x - y).max())
+            good = d <= 1e-6
+            ok &= good
+            print(f"   {v:3s} max difference after restart {d:.1e}  (limit 1e-06)  {'ok' if good else 'TOO LARGE'}")
     else:
         case, d = sys.argv[2], sys.argv[3]
         ref = json.loads((ROOT / "tests" / "reference.json").read_text())[case]

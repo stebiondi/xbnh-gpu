@@ -54,6 +54,15 @@ else
   python "$ROOT/tests/check.py" ref est "$W/est_gpu"; result $?
 fi
 
+echo "== 3. hotstart write and restart (Estero-feature deck)"
+mkdir -p "$W/hs_deck1" "$W/hs_deck2"; cp "$W/est_deck"/* "$W/hs_deck1"/
+python "$ROOT/tools/set_params.py" "$W/hs_deck1/params.txt" tstop=40 tintg=40 writehotstart=1 tinth=40 --globalvars zs uu vv
+rungpu "$W/hs_deck1" "$W/hs_write" xbnh_gpu; result $?
+cp "$W/est_deck"/* "$W/hs_deck2"/; cp "$W/hs_write"/hotstart_* "$W/hs_deck1/params.txt" "$W/hs_deck2"/
+python "$ROOT/tools/set_params.py" "$W/hs_deck2/params.txt" tstop=1 tintg=1 writehotstart=0 hotstart=1 hotstartfileno=1
+rungpu "$W/hs_deck2" "$W/hs_read" xbnh_gpu; result $?
+python "$ROOT/tests/check.py" hotstart "$W/hs_write" "$W/hs_read"; result $?
+
 echo
 echo "tests passed: $pass, failed: $fail   (run folders in $W)"
 [ $fail = 0 ]

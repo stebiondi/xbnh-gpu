@@ -166,6 +166,31 @@ for f in z.grd nhbcflist.bcf nh_series00001.bcf water_elev.dat wind.txt hotstart
 xbnh_gpu > stdout.txt
 \end{lstlisting}
 
+\subsection{Chaining segments}\label{sec:chain}
+Long storms are usually run as a chain of shorter segments, each started from the state at the end of the
+previous one. With \code{writehotstart = 1} the GPU code writes the nine files that \code{hotstart = 1}
+reads (\code{hotstart\_zs, zb, uu, vv, wb, ws, breaking, umean, vmean} plus a six-digit number) every
+\code{tinth} seconds, numbered from 1, in the same ASCII format as XBeach, so the files are interchangeable
+between the two codes. A 900\,s segment written at its end is restarted with:
+\begin{lstlisting}[language=bash]
+mkdir seg2 && cd seg2
+cp ../seg1/hotstart_*000001.dat .        # copy, do not link: seg2 writes files of the same names
+cp ../deck_seg2/params.txt ../deck_seg2/water_elev.dat ../deck_seg2/wind.txt .
+python $XBNH/tools/set_params.py params.txt hotstart=1 hotstartfileno=1 writehotstart=1 tinth=900 tstop=900
+xbnh_gpu_sp > stdout.txt
+\end{lstlisting}
+Copy the hotstart files rather than linking them: a run that writes hotstart files of the same name would
+write through the links into the previous segment. Time restarts from zero in every segment, as in XBeach,
+so the tide, wind and boundary files of each segment start at its own $t = 0$.
+
+\textbf{Spectral wave boundaries.} The GPU code reads a ready nonhydrostatic boundary series
+(\code{wbctype = reuse} or \code{ts\_nonh}) but does not synthesise one from a spectrum. For a deck with
+\code{wbctype = swan}, \code{jonstable} or similar, run the reference XBeach on it once with a short
+\code{tstop} (a few seconds). XBeach writes \code{nhbcflist.bcf} and \code{nh\_series00001.bcf} for the
+whole boundary duration before it starts stepping. Then set \code{wbctype = reuse} for the GPU run. Only the
+offshore boundary matters for this step, so a copy of the deck cut to \code{nx = 4} with the same \code{ny},
+\code{dy} and spectra gives the same series much faster. The synthesis runs on one core; on the Estero deck (5740 boundary rows, 900\,s) it takes one to two hours.
+
 \subsection{Output}
 \begin{itemize}
 \item Global output for each variable listed under \code{nglobalvar} (\code{zs, u, v, uu, vv, ws, wb, hh,
@@ -212,7 +237,7 @@ Back & \code{back = wall}, \code{abs\_1d}, \code{abs\_2d} \\
 Laterals & \code{left}, \code{right} = \code{neumann} or \code{wall}; or \code{cyclic = 1} \\
 Water level & \code{zs0}, or \code{zs0file} with \code{tideloc = 1}; \code{tidetype = velocity} \\
 Wind & \code{windv}, \code{windth}, or \code{windfile} \\
-Restart & \code{hotstart = 1} (ASCII files written by \code{writehotstart}) \\
+Restart & read: \code{hotstart = 1}, \code{hotstartfileno}; write: \code{writehotstart = 1} every \code{tinth} (XBeach ASCII format, files numbered from 1) \\
 Output & \code{nglobalvar}, \code{npoints}, \code{tintg}, \code{tintp} (fortran format) \\
 \bottomrule
 \end{tabularx}
@@ -242,7 +267,9 @@ output only. The two patches are:
 \begin{itemize}
 \item a rip-channel beach (39\,k cells, 120\,s);
 \item the Estero-feature deck (40\,k cells, 100\,s; cyclic laterals, \code{abs\_2d}, vector boundary,
-      tide and wind files, point output).
+      tide and wind files, point output);
+\item a hotstart round trip on the Estero-feature deck: a 40\,s run writes a hotstart, a second run
+      restarts from it, and the restarted water level and velocities must match to $10^{-6}$.
 \end{itemize}
 When the reference XBeach exists, the same decks run in Fortran XBeach and the agreement is checked
 against thresholds. Otherwise the GPU statistics are checked against values stored in
@@ -260,7 +287,13 @@ are from the RTX~2000 Ada):
    Hs_rel          0.0032  (limit 0.02)  ok
    current_rel     0.0046  (limit 0.1)  ok
    zs_rms_m        0.0029  (limit 0.02)  ok
-tests passed: 6, failed: 0
+== 3. hotstart write and restart (Estero-feature deck)
+ ...
+   zs  max difference after restart 5.0e-09  (limit 1e-06)  ok
+   uu  max difference after restart 5.0e-09  (limit 1e-06)  ok
+   vv  max difference after restart 5.0e-09  (limit 1e-06)  ok
+   PASS
+tests passed: 9, failed: 0
 \end{lstlisting}
 
 %=====================================================================================================

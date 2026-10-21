@@ -63,7 +63,13 @@ GPU-specific keys (optional, in `params.txt`):
 - **Laterals:** `left`/`right = neumann | wall`, or `cyclic = 1`.
 - **Water level, wind, friction:** tide as `zs0` or `zs0file` with `tideloc = 1`; constant wind or
   `windfile`; Manning friction; Smagorinsky viscosity; `nhbreaker = 1`; `secorder = 1`.
-- **Restart and output:** ASCII hotstart (`hotstart = 1`), global and point output in Fortran format.
+- **Restart and output:** ASCII hotstart, read (`hotstart = 1`) and written (`writehotstart = 1`, every
+  `tinth`), in the XBeach file format, so a long run can be chained in segments as with XBeach;
+  global and point output in Fortran format.
+
+Spectral boundaries (`wbctype = swan`, `jonstable`, ...) are not generated on the GPU. Run the reference
+XBeach on the deck once with a small `tstop`: it writes `nhbcflist.bcf` and `nh_series00001.bcf`, and the
+GPU run then uses them with `wbctype = reuse` (see the guide, "Chaining segments").
 
 Not supported, so the program stops with a message:
 - `nonhq3d = 1`, `vardx = 1`, rotated grids;

@@ -60,6 +60,7 @@ export PATH=$ROOT/bin:\$PATH
 [ -d /usr/lib/wsl/lib ] && export LD_LIBRARY_PATH=/usr/lib/wsl/lib:\${LD_LIBRARY_PATH:-}
 export XBEACH_SERIAL=$ROOT/xbeach/dist_serial/bin/xbeach
 export XBEACH_MPI=$ROOT/xbeach/dist_mpi/bin/xbeach
+export XBNH=$ROOT
 EOF
 echo
 echo "Done. Next:  source $ROOT/env.sh   then   bash $ROOT/tests/run_tests.sh"

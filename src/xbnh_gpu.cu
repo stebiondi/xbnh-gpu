@@ -1369,6 +1369,34 @@ template <typename T> static void read_hotstart(const std::string &var, int file
     fclose(f);
 }
 
+// postprocess.F90 / writehotstart: same layout as the reader, '(1X,E15.8)' (Fortran 0.dddddddd mantissa) or '(1X,I4)'.
+static void fortran_e15_8(double v, char *out) {   // 16 chars incl. the leading blank, NUL-terminated
+    if (!(fabs(v) >= 1e-99)) { snprintf(out, 17, "  0.00000000E+00"); return; }
+    double a = fabs(v); int e = (int)floor(log10(a)) + 1;
+    long long m = llround(a / pow(10.0, e) * 1e8);
+    if (m >= 100000000LL) { m /= 10; e++; }
+    if (m < 10000000LL) { m *= 10; e--; }
+    snprintf(out, 17, " %s0.%08lldE%c%02d", v < 0 ? "-" : " ", m, e < 0 ? '-' : '+', abs(e));
+}
+template <typename T> static void write_hotstart(const std::string &var, int fileno, int NX1, int NY1, const std::vector<T> &a, bool isint) {
+    char fn[256]; snprintf(fn, sizeof fn, "hotstart_%s%06d.dat", var.c_str(), fileno);
+    FILE *f = fopen(fn, "w");
+    if (!f) { fprintf(stderr, "cannot write %s\n", fn); exit(1); }
+    std::vector<char> line((size_t)NX1 * 16 + 2);
+    char cell[24];
+    for (int j = 0; j < NY1; j++) {
+        size_t n = 0;
+        for (int i = 0; i < NX1; i++) {
+            double v = (double)a[(size_t)j * NX1 + i];
+            if (isint) n += snprintf(line.data() + n, 6, " %4d", (int)v);
+            else { fortran_e15_8(v, cell); memcpy(line.data() + n, cell, 16); n += 16; }
+        }
+        line[n++] = '\n';
+        fwrite(line.data(), 1, n, f);
+    }
+    fclose(f);
+}
+
 template <typename T> static T *dalloc(size_t n, T val = 0) {
     T *p; CK(cudaMalloc(&p, n * sizeof(T)));
     std::vector<T> h(n, val); CK(cudaMemcpy(p, h.data(), n * sizeof(T), cudaMemcpyHostToDevice));
@@ -1428,6 +1456,8 @@ int main(int argc, char **argv) {
     int hotstart = (int)getd(P, "hotstart", 0), hsno = (int)getd(P, "hotstartfileno", 0);
     int keepuv = (int)getd(P, "gpu_hotstart_keepuv", 1);   // 1: as the hsfix build; 0: trunk r6167 zeroes uu, vv
     int nglobal = (int)getd(P, "nglobalvar", 0);
+    int writehs = (int)getd(P, "writehotstart", 0);
+    double tinth = getd(P, "tinth", tstop);
 
     // tide (readtide / tide_init): tideloc 0 -> constant zs0, tideloc 1 -> one time series
     std::vector<double> tide_t, tide_z;
@@ -1629,6 +1659,29 @@ int main(int argc, char **argv) {
         CK(cudaMemcpy(pbuf.data(), dpout, (size_t)np * nv * 8, cudaMemcpyDeviceToHost));
         for (int p = 0; p < np; p++) { fwrite(&tt, 8, 1, pts[p].f); fwrite(&pbuf[(size_t)p * nv], 8, nv, pts[p].f); }
     };
+    // writehotstart: every tinth, files numbered from 1, the variables hotstart = 1 reads back
+    int hs_count = 0;
+    auto write_hotstart_all = [&](double tt) {
+        hs_count++;
+        std::vector<real> a(N);
+        auto D2H = [&](real *src) { CK(cudaMemcpy(a.data(), src, N * sizeof(real), cudaMemcpyDeviceToHost)); };
+        const char *nm[] = {"zs", "zb", "uu", "vv", "wb", "ws"};
+        real *src[] = {d.zs, d.zb, d.uu, d.vv, d.wb, d.ws};
+        for (int q = 0; q < 6; q++) { D2H(src[q]); write_hotstart(nm[q], hs_count, NX1, NY1, a, false); }
+        std::vector<int> b(N);
+        CK(cudaMemcpy(b.data(), d.breaking, N * sizeof(int), cudaMemcpyDeviceToHost));
+        write_hotstart("breaking", hs_count, NX1, NY1, b, true);
+        // umean/vmean are only used on the front (i = 1) and back (i = nx) columns
+        std::vector<real> r1(NY1), rN(NY1);
+        for (int uv = 0; uv < 2; uv++) {
+            CK(cudaMemcpy(r1.data(), uv ? d.vm1 : d.um1, NY1 * sizeof(real), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(rN.data(), uv ? d.vmN : d.umN, NY1 * sizeof(real), cudaMemcpyDeviceToHost));
+            std::fill(a.begin(), a.end(), (real)0);
+            for (int j = 1; j <= NY1; j++) { a[I(1, j)] = r1[j - 1]; a[I(nx, j)] = rN[j - 1]; }
+            write_hotstart(uv ? "vmean" : "umean", hs_count, NX1, NY1, a, false);
+        }
+        printf("hotstart %06d written at t = %.3f s\n", hs_count, tt); fflush(stdout);
+    };
     double t = tstart;
     long nstep = 0, itsum = 0, itmax = 0, nsolve = 0, nonconv = 0;
     double tsolve = 0;
@@ -1641,7 +1694,8 @@ int main(int argc, char **argv) {
     if (np > 0) { output_points(t, 1); next_p += tintp; }
     // XBeach also steps onto the global-output times when no global variables are written
     double next_g_clock = tstart + tintg;
-    auto tnext_of = [&]() { return std::min(std::min(std::min(next_g, next_p), next_g_clock), tstop); };
+    double next_h = writehs ? tstart + tinth : BIG;
+    auto tnext_of = [&]() { return std::min(std::min(std::min(std::min(next_g, next_p), next_g_clock), next_h), tstop); };
     double tnext = tnext_of();
     std::vector<double> bu(NY1), bv(NY1), bz(NY1);
     std::vector<real> ru(NY1), rv(NY1), rz(NY1);
@@ -1778,6 +1832,7 @@ int main(int argc, char **argv) {
             if (t >= next_g - 1e-9) { output_global(0); next_g += tintg; }
             if (t >= next_p - 1e-9) { output_points(t, 0); next_p += tintp; }
             if (t >= next_g_clock - 1e-9) next_g_clock += tintg;
+            if (t >= next_h - 1e-9) { write_hotstart_all(t); next_h += tinth; }
             tnext = tnext_of();
         }
         if (nstep % 2000 == 0) {
