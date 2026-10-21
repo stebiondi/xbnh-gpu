@@ -1,0 +1,16 @@
+# Build and analysis environment for xbnh-gpu (user-level, no admin rights needed).
+# The NVIDIA driver is the only system requirement (Linux >= 525.60, or Windows driver for WSL2).
+name: xbnh-gpu
+channels:
+  - conda-forge
+dependencies:
+  - cuda-version=12.6
+  - cuda-nvcc
+  - cuda-cudart-dev
+  - gcc_linux-64=13
+  - gxx_linux-64=13
+  - make
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib-base

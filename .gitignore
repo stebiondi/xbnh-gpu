@@ -1,0 +1,13 @@
+bin/
+env.sh
+tests/work/
+benchmark/
+xbeach/src_r*/
+xbeach/build_*/
+xbeach/dist_*/
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+__pycache__/
+*.dat

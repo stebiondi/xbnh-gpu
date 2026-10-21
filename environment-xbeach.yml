@@ -1,0 +1,16 @@
+# Optional: toolchain for the reference Fortran XBeach build (serial and Open MPI), user-level.
+name: xbnh-xbeach
+channels:
+  - conda-forge
+dependencies:
+  - gfortran=13
+  - gcc=13
+  - openmpi
+  - make
+  - autoconf
+  - automake
+  - libtool
+  - m4
+  - subversion
+  - python=3.11
+  - mako
