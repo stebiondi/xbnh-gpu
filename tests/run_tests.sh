@@ -63,6 +63,17 @@ python "$ROOT/tools/set_params.py" "$W/hs_deck2/params.txt" tstop=1 tintg=1 writ
 rungpu "$W/hs_deck2" "$W/hs_read" xbnh_gpu; result $?
 python "$ROOT/tests/check.py" hotstart "$W/hs_write" "$W/hs_read"; result $?
 
+echo "== 4. Manning map (bedfricfile): a uniform map must reproduce bedfriccoef"
+mkdir -p "$W/fr_deck1" "$W/fr_deck2"; cp "$W/est_deck"/* "$W/fr_deck1"/; cp "$W/est_deck"/* "$W/fr_deck2"/
+python "$ROOT/tools/set_params.py" "$W/fr_deck1/params.txt" tstop=20 tintg=20 bedfriction=manning bedfriccoef=0.02 --globalvars zs uu vv
+python -c "import numpy as np, sys; z = np.loadtxt(sys.argv[1]); np.savetxt(sys.argv[2], np.full(z.shape, 0.02), fmt='%.3f')" \
+  "$W/fr_deck1/z.grd" "$W/fr_deck2/fric.grd"
+cp "$W/fr_deck1/params.txt" "$W/fr_deck2/params.txt"
+python "$ROOT/tools/set_params.py" "$W/fr_deck2/params.txt" bedfricfile=fric.grd
+rungpu "$W/fr_deck1" "$W/fr_coef" xbnh_gpu; result $?
+rungpu "$W/fr_deck2" "$W/fr_file" xbnh_gpu; result $?
+python "$ROOT/tests/check.py" same "$W/fr_coef" "$W/fr_file"; result $?
+
 echo
 echo "tests passed: $pass, failed: $fail   (run folders in $W)"
 [ $fail = 0 ]

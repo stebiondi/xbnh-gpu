@@ -106,6 +106,7 @@ struct Dev {
     double *msum;                               // boundary-mean u, v: [0,1] front, [2,3] back
     unsigned long long *skey;                   // last NH / non-NH point in XBeach loop order
     double *stale;                              // stale loop variables of nonh_1lay_cor: dzb_s, dzs_e
+    real *nmanf;                                // per-cell Manning n from bedfricfile (nullptr: uniform c.nman)
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -315,7 +316,8 @@ __global__ void k_slopes_rough(Dev d) {
     if (IN(2, c.nx - 1, 2, c.ny)) d.dzsdx[k] = (d.zs[ID(i + 1, j)] - d.zs[k]) / c.dx;
     if (IN(2, c.nx, 2, c.ny - 1)) d.dzsdy[k] = (d.zs[ID(i, j + 1)] - d.zs[k]) / c.dy;
     // bedroughness_update, manning
-    real n2g = c.g * c.nman * c.nman;
+    real nm = d.nmanf ? d.nmanf[k] : c.nman;   // s%bedfriccoef(i,j), same index for u and v points
+    real n2g = c.g * nm * nm;
     d.cfu[k] = d.wetu[k] == 1 ? fmax(fmin(n2g / cbrt(d.hu[k]), c.maxcf), c.mincf) : c.maxcf;
     d.cfv[k] = d.wetv[k] == 1 ? fmax(fmin(n2g / cbrt(d.hv[k]), c.maxcf), c.mincf) : c.maxcf;
 }
@@ -1419,6 +1421,7 @@ int main(int argc, char **argv) {
     h.g = getd(P, "g", 9.81); h.rho = getd(P, "rho", 1025);
     h.eps = getd(P, "eps", 0.005); h.eps_sd = getd(P, "eps_sd", 0.5); h.umin = getd(P, "umin", 0);
     if (gets(P, "bedfriction", "manning") != "manning") fail("only bedfriction = manning is supported");
+    std::string bedfricfile = gets(P, "bedfricfile", "");
     h.nman = getd(P, "bedfriccoef", 0.02); h.maxcf = getd(P, "maxcf", 0.04); h.mincf = getd(P, "mincf", 0);
     h.nuh = getd(P, "nuh", 0.1); h.nuhv = getd(P, "nuhv", 1); h.smag = (int)getd(P, "smag", 1);
     h.breakviscfac = getd(P, "breakviscfac", 1.5); h.maxbrsteep = getd(P, "maxbrsteep", 0.4);
@@ -1598,6 +1601,15 @@ int main(int argc, char **argv) {
     d.msum = dalloc<double>(4); d.skey = dalloc<unsigned long long>(2); d.stale = dalloc<double>(2);
     double *dout; CK(cudaMalloc(&dout, N * sizeof(double)));
     auto H2D = [&](real *dst, std::vector<real> &src) { CK(cudaMemcpy(dst, src.data(), src.size() * sizeof(real), cudaMemcpyHostToDevice)); };
+    d.nmanf = nullptr;
+    if (!bedfricfile.empty()) {   // readxbeachgrid layout as the depfile: ny+1 rows of nx+1 values
+        std::ifstream f(bedfricfile);
+        if (!f) fail("cannot open bedfricfile");
+        std::vector<real> nm(N);
+        for (size_t k = 0; k < N; k++) { double v; if (!(f >> v)) fail("bedfricfile has fewer than (nx+1)(ny+1) values"); nm[k] = (real)v; }
+        d.nmanf = R(); H2D(d.nmanf, nm);
+        printf("bedfricfile %s: Manning n %.4f to %.4f\n", bedfricfile.c_str(), (double)*std::min_element(nm.begin(), nm.end()), (double)*std::max_element(nm.begin(), nm.end()));
+    }
     H2D(d.zb, zb); H2D(d.zs, zs); H2D(d.hh, hh); H2D(d.hu, hu); H2D(d.hv, hv); H2D(d.wcoef, wc); H2D(d.zbu, zbu); H2D(d.zbv, zbv);
     H2D(d.uu, uu); H2D(d.vv, vv); H2D(d.ws, ws); H2D(d.wb, wb); H2D(d.zs0, zs0);
     H2D(d.um1, um1); H2D(d.vm1, vm1); H2D(d.umN, umN); H2D(d.vmN, vmN);

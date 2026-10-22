@@ -62,7 +62,8 @@ GPU-specific keys (optional, in `params.txt`):
 - **Back boundary:** `back = wall | abs_1d | abs_2d`.
 - **Laterals:** `left`/`right = neumann | wall`, or `cyclic = 1`.
 - **Water level, wind, friction:** tide as `zs0` or `zs0file` with `tideloc = 1`; constant wind or
-  `windfile`; Manning friction; Smagorinsky viscosity; `nhbreaker = 1`; `secorder = 1`.
+  `windfile`; Manning friction, uniform (`bedfriccoef`) or per cell (`bedfricfile`, same layout as the
+  depth file); Smagorinsky viscosity; `nhbreaker = 1`; `secorder = 1`.
 - **Restart and output:** ASCII hotstart, read (`hotstart = 1`) and written (`writehotstart = 1`, every
   `tinth`), in the XBeach file format, so a long run can be chained in segments as with XBeach;
   global and point output in Fortran format.

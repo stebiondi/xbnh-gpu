@@ -22,7 +22,7 @@
 
 \title{\textbf{xbnh-gpu}\\[4pt]\large XBeach non-hydrostatic on the GPU: installation, use and validation}
 \author{Stefano Biondi}
-\date{Version 1.0, October 2026}
+\date{Version 1.2, October 2026}
 
 \begin{document}
 \sloppy
@@ -230,7 +230,7 @@ XBeach ignores these keys, apart from a warning about unknown parameters.
 \toprule
 Group & Supported \\
 \midrule
-Model & \code{wavemodel = nonh}, \code{nonhq3d = 0}, \code{nhbreaker = 1}, \code{secorder = 1}, Smagorinsky (\code{smag}), Manning (\code{bedfriction = manning}) \\
+Model & \code{wavemodel = nonh}, \code{nonhq3d = 0}, \code{nhbreaker = 1}, \code{secorder = 1}, Smagorinsky (\code{smag}), Manning (\code{bedfriction = manning}), uniform \code{bedfriccoef} or per-cell \code{bedfricfile} (same layout as the depth file), \code{maxcf}, \code{mincf} \\
 Grid & uniform rectilinear, \code{vardx = 0}, \code{alfa = 0}, $n_y > 4$ \\
 Offshore & \code{front = nonh\_1d}, \code{ARC = 1}; \code{wbctype = ts\_nonh} (\code{boun\_U.bcf}) or \code{reuse} (\code{nhbcflist.bcf}, one entry, scalar or vector file with U, V, Z) \\
 Back & \code{back = wall}, \code{abs\_1d}, \code{abs\_2d} \\
@@ -269,7 +269,9 @@ output only. The two patches are:
 \item the Estero-feature deck (40\,k cells, 100\,s; cyclic laterals, \code{abs\_2d}, vector boundary,
       tide and wind files, point output);
 \item a hotstart round trip on the Estero-feature deck: a 40\,s run writes a hotstart, a second run
-      restarts from it, and the restarted water level and velocities must match to $10^{-6}$.
+      restarts from it, and the restarted water level and velocities must match to $10^{-6}$;
+\item a per-cell Manning map: a uniform \code{bedfricfile} of 0.02 must reproduce \code{bedfriccoef = 0.02}
+      to round-off ($10^{-9}$).
 \end{itemize}
 When the reference XBeach exists, the same decks run in Fortran XBeach and the agreement is checked
 against thresholds. Otherwise the GPU statistics are checked against values stored in
@@ -293,7 +295,11 @@ are from the RTX~2000 Ada):
    uu  max difference after restart 5.0e-09  (limit 1e-06)  ok
    vv  max difference after restart 5.0e-09  (limit 1e-06)  ok
    PASS
-tests passed: 9, failed: 0
+== 4. Manning map (bedfricfile): a uniform map must reproduce bedfriccoef
+ ...
+   zs  max difference 9.6e-13  (limit 1e-09, round-off)  ok
+   PASS
+tests passed: 12, failed: 0
 \end{lstlisting}
 
 %=====================================================================================================
@@ -451,6 +457,15 @@ The deck uses an option outside the supported list; the message names it.
 \item[``time step collapsed'']
 The solution became unstable and the time step went to zero; XBeach stops in the same way. Check the
 deck in XBeach first.
+\item[\code{micromamba create} fails or hangs (blocked conda-forge)]
+Some institutional networks block or inspect traffic to conda-forge. Set the proxy first
+(\code{export https\_proxy=http://proxy:port}), or skip micromamba if a CUDA toolkit (12.x, with
+\code{g++} 10 or newer) is already installed: \code{make NVCC=/usr/local/cuda/bin/nvcc}, then run the
+tests with any Python that has NumPy. \code{env.sh} is then not needed; put \code{bin/} on \code{PATH}
+and set \code{XBNH} to the repository folder.
+\item[No MPI reference XBeach (``no XBeach MPI build found'')]
+The tests then compare the Estero-feature deck with stored XBeach statistics instead, which is enough to
+validate the GPU build. The MPI build needs Open MPI from \code{environment-xbeach.yml}.
 \item[XBeach stops with ``Missing comma between descriptors'']
 This is an unpatched XBeach with output points. Use the build from \code{xbeach/build\_xbeach.sh}.
 \end{description}

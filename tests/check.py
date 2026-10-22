@@ -5,6 +5,7 @@ Pass/fail checks used by run_tests.sh.
   check.py fields <ref dir> <test dir>   Estero-feature agreement (tools/compare_fields.py metrics)
   check.py ref <rip|est> <test dir>      GPU statistics against tests/reference.json (no XBeach needed)
   check.py hotstart <run dir> <restart dir>   state written by writehotstart is read back by hotstart = 1
+  check.py same <dir a> <dir b>          zs, uu, vv equal to round-off (1e-9)
 
 Thresholds are several times the differences found between XBeach builds and rank counts (see the guide),
 so a pass means the GPU code reproduces XBeach, not that the two are identical.
@@ -87,6 +88,16 @@ def main():
             good = d <= 1e-6
             ok &= good
             print(f"   {v:3s} max difference after restart {d:.1e}  (limit 1e-06)  {'ok' if good else 'TOO LARGE'}")
+    elif mode == "same":
+        # two runs that must agree to round-off (e.g. uniform bedfricfile against bedfriccoef)
+        a, b = Path(sys.argv[2]), Path(sys.argv[3])
+        ok = True
+        for v in ["zs", "uu", "vv"]:
+            x, y = np.fromfile(a / f"{v}.dat", "<f8"), np.fromfile(b / f"{v}.dat", "<f8")
+            d = float(np.abs(x - y).max()) if x.shape == y.shape else float("inf")
+            good = d <= 1e-9
+            ok &= good
+            print(f"   {v:3s} max difference {d:.1e}  (limit 1e-09, round-off)  {'ok' if good else 'TOO LARGE'}")
     else:
         case, d = sys.argv[2], sys.argv[3]
         ref = json.loads((ROOT / "tests" / "reference.json").read_text())[case]
