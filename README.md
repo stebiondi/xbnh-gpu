@@ -25,10 +25,10 @@ You need an NVIDIA GPU with compute capability 6.0 or newer (Pascal and later), 
 WSL2, the normal Windows driver) and an internet connection for the first install.
 
 ```bash
-git clone <this repository> xbnh-gpu && cd xbnh-gpu
+git clone https://github.com/stebiondi/xbnh-gpu xbnh-gpu && cd xbnh-gpu
 ./install.sh                    # micromamba + CUDA 12.6 toolchain in user space, builds bin/xbnh_gpu{,_sp}
 source env.sh                   # puts xbnh_gpu on PATH (do this in every new shell)
-bash tests/run_tests.sh         # quick tests, about 2 minutes
+bash tests/run_tests.sh         # quick tests, 2 to 5 minutes
 bash tests/run_features.sh      # 96 feature decks against stored XBeach statistics, about 5 minutes
 ```
 

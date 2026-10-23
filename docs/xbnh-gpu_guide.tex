@@ -119,7 +119,7 @@ installed in the user's home directory.
 
 \subsection{Automatic}
 \begin{lstlisting}[language=bash]
-git clone <repository URL> xbnh-gpu
+git clone https://github.com/stebiondi/xbnh-gpu xbnh-gpu
 cd xbnh-gpu
 ./install.sh                  # GPU code only
 ./install.sh --with-xbeach    # GPU code and the reference Fortran XBeach (10-20 min more)
@@ -316,7 +316,7 @@ current, mean water level, RMS bed change, mean concentration) are compared with
 \code{tests/features/reference.json}, with the same limits.
 
 \subsection{Quick tests}
-\code{tests/run\_tests.sh} runs two small decks on the GPU in both precisions:
+\code{tests/run\_tests.sh} runs four tests on two small decks, on the GPU in both precisions:
 \begin{itemize}
 \item a rip-channel beach (39\,k cells, 120\,s);
 \item the cyclic-feature deck (40\,k cells, 100\,s; cyclic laterals, \code{abs\_2d}, vector boundary,
@@ -455,7 +455,7 @@ Comparison & $H_s$ & Mean current & Longshore current & $z_s$ \\
 Serial XBeach vs GPU, hotstart, Neumann laterals & 0.20\,\% & 0.82\,\% & 1.2\,\% & 2.6\,mm \\
 XBeach MPI-2 vs GPU, cyclic & 0.34\,\% & 2.0\,\% & 2.3\,\% & 4.7\,mm \\
 XBeach MPI-4 vs GPU, cyclic & 0.54\,\% & 3.4\,\% & 4.9\,\% & 6.2\,mm \\
-XBeach MPI-4 vs MPI-2 (yardstick) & 0.44\,\% & 2.8\,\% & 2.9\,\% & 5.5\,mm \\
+XBeach MPI-4 vs MPI-2 & 0.44\,\% & 2.8\,\% & 2.9\,\% & 5.5\,mm \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -487,7 +487,7 @@ Cells & XBeach MPI, best rank count & GPU fp64 & GPU fp32 & Speed-up fp64 / fp32
 fp64, dotted fp32); (b) cost per cell and step against grid size.}\label{fig:bench}
 \end{figure}
 
-The scaling has three features worth knowing.
+Three features of the scaling stand out.
 \begin{itemize}
 \item The CPU stops gaining beyond about 8 ranks, because all cores share the same memory bandwidth.
 \item The GPU cost per cell is flat from 0.16 to 8.7 million cells.
