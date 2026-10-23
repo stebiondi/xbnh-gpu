@@ -1,7 +1,7 @@
 """
 Build an XBeach non-hydrostatic test deck that runs unchanged in Fortran XBeach and in xbnh_gpu.
 
-Barred beach with a rip channel, the nearshore setting of Estero Island at the XBeach estero42 resolution:
+Barred beach with a rip channel at 2 m resolution:
   - offshore depth 8 m, plane slope 1:50 up to +2 m (dry beach at the back of the domain),
   - shore-parallel bar (Gaussian, 1.5 m high, 25 m e-folding half-width) at x = 300 m, crest 0.5 m deep,
   - rip channels through the bar (60 m wide, every 300 m alongshore, first at y = 150 m), so the flow is 2D.

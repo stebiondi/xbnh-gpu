@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Quick tests, a few minutes on any recent GPU:
 #   1. rip-channel beach (39k cells, 120 s, ts_nonh boundary, wall back, Neumann laterals): fp64 and fp32,
-#   2. Estero-feature deck (40k cells, 100 s: cyclic laterals, abs_2d back, vector U/V/Z boundary, tide
+#   2. cyclic-feature deck (40k cells, 100 s: cyclic laterals, abs_2d back, vector U/V/Z boundary, tide
 #      file, wind file, point output).
 # When the reference XBeach is built (install.sh --with-xbeach), the same decks also run in Fortran XBeach
 # (serial for 1, MPI with 2 ranks for 2) and the agreement is checked against thresholds; otherwise the GPU
@@ -41,31 +41,31 @@ else
   python "$ROOT/tests/check.py" ref rip "$W/rip_gpu"; result $?
 fi
 
-echo "== 2. Estero-feature deck"
-python "$ROOT/examples/estero_features/make_case.py" "$W/est_deck" --tstop 100 > /dev/null
-rungpu "$W/est_deck" "$W/est_gpu" xbnh_gpu; result $?
+echo "== 2. cyclic-feature deck"
+python "$ROOT/examples/cyclic_features/make_case.py" "$W/cyc_deck" --tstop 100 > /dev/null
+rungpu "$W/cyc_deck" "$W/cyc_gpu" xbnh_gpu; result $?
 if [ -x "$XM" ] && command -v mpirun > /dev/null; then
   echo " Fortran XBeach (MPI, 2 ranks) against GPU"
-  mkdir -p "$W/est_xb"; cp "$W/est_deck"/* "$W/est_xb"/
-  (cd "$W/est_xb" && mpirun --oversubscribe -np 2 "$XM" < /dev/null > stdout.txt 2>&1)
-  python "$ROOT/tests/check.py" fields "$W/est_xb" "$W/est_gpu"; result $?
+  mkdir -p "$W/cyc_xb"; cp "$W/cyc_deck"/* "$W/cyc_xb"/
+  (cd "$W/cyc_xb" && mpirun --oversubscribe -np 2 "$XM" < /dev/null > stdout.txt 2>&1)
+  python "$ROOT/tests/check.py" fields "$W/cyc_xb" "$W/cyc_gpu"; result $?
 else
   echo " reference statistics (no XBeach MPI build found)"
-  python "$ROOT/tests/check.py" ref est "$W/est_gpu"; result $?
+  python "$ROOT/tests/check.py" ref cyc "$W/cyc_gpu"; result $?
 fi
 
-echo "== 3. hotstart write and restart (Estero-feature deck)"
-mkdir -p "$W/hs_deck1" "$W/hs_deck2"; cp "$W/est_deck"/* "$W/hs_deck1"/
+echo "== 3. hotstart write and restart (cyclic-feature deck)"
+mkdir -p "$W/hs_deck1" "$W/hs_deck2"; cp "$W/cyc_deck"/* "$W/hs_deck1"/
 python "$ROOT/tools/set_params.py" "$W/hs_deck1/params.txt" tstop=40 tintg=40 writehotstart=1 tinth=40 --globalvars zs uu vv
 rungpu "$W/hs_deck1" "$W/hs_write" xbnh_gpu; result $?
-cp "$W/est_deck"/* "$W/hs_deck2"/; cp "$W/hs_write"/hotstart_* "$W/hs_deck1/params.txt" "$W/hs_deck2"/
+cp "$W/cyc_deck"/* "$W/hs_deck2"/; cp "$W/hs_write"/hotstart_* "$W/hs_deck1/params.txt" "$W/hs_deck2"/
 python "$ROOT/tools/set_params.py" "$W/hs_deck2/params.txt" tstop=1 tintg=1 writehotstart=0 hotstart=1 hotstartfileno=1
 rungpu "$W/hs_deck2" "$W/hs_read" xbnh_gpu; result $?
 python "$ROOT/tests/check.py" hotstart "$W/hs_write" "$W/hs_read"; result $?
 
 echo "== 4. Manning map (bedfricfile): a uniform map must reproduce bedfriccoef"
-mkdir -p "$W/fr_deck1" "$W/fr_deck2"; cp "$W/est_deck"/* "$W/fr_deck1"/; cp "$W/est_deck"/* "$W/fr_deck2"/
-python "$ROOT/tools/set_params.py" "$W/fr_deck1/params.txt" tstop=20 tintg=20 bedfriction=manning bedfriccoef=0.02 --globalvars zs uu vv
+mkdir -p "$W/fr_deck1" "$W/fr_deck2"; cp "$W/cyc_deck"/* "$W/fr_deck1"/; cp "$W/cyc_deck"/* "$W/fr_deck2"/
+python "$ROOT/tools/set_params.py" "$W/fr_deck1/params.txt" tstop=20 tintg=20 writehotstart=0 bedfriction=manning bedfriccoef=0.02 --globalvars zs uu vv
 python -c "import numpy as np, sys; z = np.loadtxt(sys.argv[1]); np.savetxt(sys.argv[2], np.full(z.shape, 0.02), fmt='%.3f')" \
   "$W/fr_deck1/z.grd" "$W/fr_deck2/fric.grd"
 cp "$W/fr_deck1/params.txt" "$W/fr_deck2/params.txt"

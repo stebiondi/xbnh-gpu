@@ -10,7 +10,9 @@ dependencies:
   - gcc_linux-64=13
   - gxx_linux-64=13
   - make
+  - libnetcdf
   - python=3.11
   - numpy
+  - netcdf4
   - pandas
   - matplotlib-base

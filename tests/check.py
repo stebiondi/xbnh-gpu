@@ -2,8 +2,8 @@
 Pass/fail checks used by run_tests.sh.
 
   check.py rip <ref dir> <test dir>      rip-beach agreement (tools/compare_rip.py metrics)
-  check.py fields <ref dir> <test dir>   Estero-feature agreement (tools/compare_fields.py metrics)
-  check.py ref <rip|est> <test dir>      GPU statistics against tests/reference.json (no XBeach needed)
+  check.py fields <ref dir> <test dir>   cyclic-feature agreement (tools/compare_fields.py metrics)
+  check.py ref <rip|cyc> <test dir>      GPU statistics against tests/reference.json (no XBeach needed)
   check.py hotstart <run dir> <restart dir>   state written by writehotstart is read back by hotstart = 1
   check.py same <dir a> <dir b>          zs, uu, vv equal to round-off (1e-9)
 

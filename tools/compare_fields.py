@@ -1,5 +1,5 @@
 """
-Compare two runs of a deck with global zs, u, v output (e.g. examples/estero_features), e.g. xbnh_gpu against
+Compare two runs of a deck with global zs, u, v output (e.g. examples/cyclic_features), e.g. xbnh_gpu against
 Fortran XBeach MPI, or XBeach MPI-2 against MPI-4 as the decomposition yardstick.
 
 Metrics over t >= tspin (global zs, u, v every tintg; point files every tintp):

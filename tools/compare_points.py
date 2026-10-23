@@ -1,5 +1,5 @@
 """
-Compare point output of Estero runs (XBeach fortran point files: per record t, zs, uu, vv, u, v as float64).
+Compare point output of runs of one deck (XBeach fortran point files: per record t, zs, uu, vv, u, v as float64).
 
 For each run directory against the reference run, over t >= tspin and for every output point:
   zs correlation, zs RMS difference, Hs = 4 std(detrended zs), mean u and v, max |(u, v)|.

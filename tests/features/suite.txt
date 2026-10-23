@@ -1,0 +1,114 @@
+# Feature test suite: one small deck per XBeach option, built by examples/features/make_case.py.
+# Columns: name, class (1d or 2d: sets the pass limits, see tests/features.py), make_case.py arguments.
+# A token +file copies tests/features/inputs/file into the deck.
+# The comparison covers every output file (global variables, points, drifters, ships).
+# Base case: barred beach 520 m long, dx = 2 m, 120 s of irregular waves (Hm0 1 m, Tp 8 s); 2D decks have
+# 61 alongshore rows with rip channels.
+
+# core hydrodynamics and grids
+base1d       1d  --ny 0
+base2d       2d
+q3_1d        1d  --ny 0 --set nonhq3d=1
+q3_2d        2d  --set nonhq3d=1
+vardx        2d  --grid vardx
+curvi        2d  --grid curvi
+rot          2d  --grid rot --set alfa=30
+dy1          2d  --dy 1 --tstop 60
+# flow boundaries
+arc0         2d  --set ARC=0
+back_abs1    2d  --set back=abs_1d --set zs0=2.4
+back_abs2    2d  --set back=abs_2d --set zs0=2.4
+back_wall    2d  --set zs0=2.4
+lat_wall     2d  --set left=wall --set right=wall
+lat_noadv    2d  --set left=no_advec --set right=no_advec
+lat_nv       2d  --set left=neumann_v --set right=neumann_v
+lat_abs      2d  --set left=abs_1d --set right=abs_1d
+# water level
+tide1_1d     1d  --ny 0 --tide loc1 --set back=abs_1d
+tide2land    2d  --tide loc2land
+tide2sea     2d  --tide loc2sea
+tide4        2d  --tide loc4
+tideinst     2d  --tide loc1 --set tidetype=instant
+epsi         2d  --tide loc1 --set epsi=0.05
+# friction, viscosity, breaking, dispersion, wind
+chezy        2d  --set bedfriction=chezy --set bedfriccoef=50
+cf           2d  --set bedfriction=cf --set bedfriccoef=0.004
+wcolebrook   2d  --set bedfriction=white-colebrook --set bedfriccoef=0.05
+smag0        2d  --set smag=0 --set nuh=0.5
+visc0        2d  --set viscosity=0
+nobreak      2d  --set nhbreaker=0
+maxbrsteep   2d  --set maxbrsteep=0.6 --set reformsteep=0.3 --set breakviscfac=2.0 --set eps=0.01
+dispc        2d  --set dispc=1.1 --set Topt=6
+umin_oldhu   2d  --set umin=0.01 --set oldhu=1
+wind_cor     2d  --set wind=1 --set windv=15 --set windth=240 --set lat=30
+# wave boundaries
+params1d     1d  --ny 0 --wbc params
+params2d     2d  --wbc params --set dir0=255
+reuse2d      2d  --wbc reuse
+jons1d       1d  --ny 0 --dx 1 --set wbctype=parametric --set bcfile=jonswap.txt --set random=0 +jonswap.txt
+jons2d       2d  --set wbctype=parametric --set bcfile=jonswap.txt --set random=0 +jonswap.txt
+jons_q3      1d  --ny 0 --dx 1 --set wbctype=parametric --set bcfile=jonswap.txt --set random=0 --set nonhq3d=1 +jonswap.txt
+jonstable    2d  --set wbctype=jonstable --set bcfile=jtable.txt --set random=0 +jtable.txt
+swan         2d  --set wbctype=swan --set bcfile=spec.sp2 --set random=0 +spec.sp2
+vardens      2d  --set wbctype=vardens --set bcfile=vardens.txt --set random=0 +vardens.txt
+highcomp1d   1d  --ny 0 --dx 1 --set wbctype=parametric --set bcfile=jonswap.txt --set random=0 --set highcomp=1 +jonswap.txt
+highcomp2d   2d  --set wbctype=parametric --set bcfile=jonswap.txt --set random=0 --set highcomp=1 +jonswap.txt
+# sources and output
+discharge    2d  --set disch_loc_file=disch_loc.txt --set disch_timeseries_file=disch_ts.txt +disch_loc.txt +disch_ts.txt
+rainfall     2d  --set rainfall=1 --set rainfallrate=500
+drifters     2d  --points --set drifterfile=drift.txt +drift.txt
+output       2d  --points --means
+timelists    1d  --ny 0 --points --means --set tsglobal=tg.txt --set tspoints=tp.txt --set tsmean=tm.txt +tg.txt +tp.txt +tm.txt
+# vegetation
+veg1d        1d  --ny 0 --veg drag
+veg2d        2d  --veg drag
+veg_q3       2d  --veg drag --set nonhq3d=1
+canopy1d     1d  --ny 0 --veg canopy
+canopy2d     2d  --veg canopy
+# groundwater
+gw_hyd1d     1d  --ny 0 --set gwflow=1 --set kx=0.002 --set aquiferbot=-3 --set gw0=0.0 --extravars gwlevel,infil
+gw_nh1d      1d  --ny 0 --set gwflow=1 --set kx=0.002 --set aquiferbot=-3 --set gw0=0.0 --set gwnonh=1 --extravars gwlevel,infil
+gw_nh2d      2d  --set gwflow=1 --set kx=0.002 --set aquiferbot=-3 --set gw0=0.0 --set gwnonh=1 --extravars gwlevel,infil
+gw_turb1d    1d  --ny 0 --set gwflow=1 --set kx=0.05 --set aquiferbot=-3 --set gw0=0.0 --set gwnonh=1 --set gwscheme=turbulent --set D50=0.02 --extravars gwlevel,infil
+gw_horinf1d  1d  --ny 0 --set gwflow=1 --set kx=0.002 --set aquiferbot=-3 --set gw0=0.0 --set gwhorinfil=1 --extravars gwlevel,infil
+gw_exp1d     1d  --ny 0 --set gwflow=1 --set kx=0.002 --set aquiferbot=-3 --set gw0=0.0 --set gwnonh=1 --set gwheadmodel=exponential --extravars gwlevel,infil
+# ships
+ship_track   2d  --ship track --wbc off --extravars ph
+ship_heading 2d  --ship heading --wbc off --extravars ph
+ship_force   2d  --ship force --wbc off --extravars ph,shipxCG,shipyCG,shipFx,shipFy,shipFz,shipMx,shipMy,shipMz
+ship_waves   2d  --ship track --extravars ph
+# sediment transport and morphology
+sed1d        1d  --ny 0 --sed basic --extravars ccg,sedero
+sed2d        2d  --sed basic --extravars ccg,sedero
+sed_vr1993   1d  --ny 0 --sed basic --set form=vanrijn1993 --extravars ccg,sedero
+sed_sv       1d  --ny 0 --sed basic --set form=soulsby_vanrijn --extravars ccg,sedero
+sed_lwt      1d  --ny 0 --sed basic --set lwt=1 --extravars ccg,sedero
+sed_aval1d   1d  --ny 0 --sed basic --ridge --extravars ccg,sedero
+sed_aval2d   2d  --sed basic --ridge --wbc params --extravars ccg,sedero
+sed_noaval   1d  --ny 0 --sed basic --ridge --set avalanching=0 --extravars ccg,sedero
+sed_opts     1d  --ny 0 --sed basic --set bdslpeffmag=soulsby_total --set bdslpeffini=total --set fallvelred=1 --set sourcesink=1 --set cmax=0.05 --extravars ccg,sedero
+sed_dilat    1d  --ny 0 --sed basic --set dilatancy=1 --set D15=0.00015 --set facsl=0.3 --set oldTsmin=1 --extravars ccg,sedero
+sed_berm     1d  --ny 0 --sed basic --set bermslopetransport=1 --set dryslp=0.6 --set wetslp=0.12 --set hswitch=0.1 --extravars ccg,sedero
+sed_struct1d 1d  --ny 0 --sed struct --extravars ccg,sedero
+sed_struct2d 2d  --sed struct --extravars ccg,sedero
+sed_ngd2_1d  1d  --ny 0 --sed ngd2 --extravars ccg,sedero
+sed_ngd2_2d  2d  --sed ngd2 --extravars ccg,sedero
+sed_morfac   1d  --ny 0 --sed basic --tstop 1200 --tintg 10 --set morfac=10 --extravars ccg,sedero
+setbathy1d   1d  --ny 0 --sed setbathy
+setbathy2d   2d  --sed setbathy
+# gravel and XBeach-G
+gr_mccall    1d  --ny 0 --sed basic --set form=mccall_vanrijn --set D50=0.005 --set D90=0.008 --extravars ccg,sedero
+gr_nielsen   1d  --ny 0 --sed basic --set form=nielsen2006 --set streaming=1 --set D50=0.005 --set D90=0.008 --extravars sedero
+gr_nl_opts   1d  --ny 0 --sed basic --set form=nielsen2006 --set streaming=1 --set sedfricfac=nielsen --set phaselag=1 --set thetanum=0.8 --set slopecorr=nielsen --set D50=0.005 --set D90=0.008 --extravars sedero
+gr_intra     1d  --ny 0 --sed basic --set form=intrasedtr --set D50=0.005 --set D90=0.008 --extravars sedero
+gr_intra_lwt 1d  --ny 0 --sed basic --set form=intrasedtr --set lwt=1 --set slopecorr=nielsen --set D50=0.005 --set D90=0.008 --extravars sedero
+xbg          1d  --ny 0 --set useXBeachGSettings=1 --extravars sedero,gwlevel
+xbg_brk2     1d  --ny 0 --set useXBeachGSettings=1 --set nhbreaker=2 --extravars sedero,gwlevel
+xbg_brk3     1d  --ny 0 --set useXBeachGSettings=1 --set nhbreaker=3 --extravars sedero,gwlevel
+xbg_nielsen  1d  --ny 0 --set useXBeachGSettings=1 --set nhbreaker=2 --set friction_acceleration=nielsen --set form=nielsen2006 --set streaming=1 --extravars sedero,gwlevel
+fric_acc_mc  1d  --ny 0 --set friction_acceleration=mccall --set ci=1.2
+fric_acc_nl  1d  --ny 0 --set friction_acceleration=nielsen --set phit=30
+fric_turb    1d  --ny 0 --sed basic --set lwt=1 --set friction_turbulence=1 --set gamma_turb=1.5 --extravars sedero
+wc_grain     1d  --ny 0 --set bedfriction=white-colebrook-grainsize --set D90=0.002
+wc_grain_ngd 1d  --ny 0 --sed ngd2 --set bedfriction=white-colebrook-grainsize --extravars sedero
+dynrough     1d  --ny 0 --sed basic --set dynamicroughness=1 --set bedfriction=manning --set bedfricfile=nman.txt --extravars sedero +nman.txt

@@ -2,8 +2,8 @@
 Two small patches to XBeach trunk r6167, applied by build_xbeach.sh (idempotent, line-ending safe).
 
 1. initialize.F90, flow_init: keep uu and vv read from the hotstart files (trunk zeroes them after
-   hotstart_init_1 has read them, so every hotstart restarts from rest). This is the build used for the
-   Estero runs, and it matches the xbnh-gpu default (gpu_hotstart_keepuv = 1).
+   hotstart_init_1 has read them, so every hotstart restarts from rest). This matches the
+   xbnh-gpu default (gpu_hotstart_keepuv = 1).
 2. postprocess.F90, snappointstogrid: a missing comma in a log-message format ('i0'): ') makes point
    output stop at start-up with "Missing comma between descriptors" (always in serial builds, intermittently
    under MPI). Only the message format changes.

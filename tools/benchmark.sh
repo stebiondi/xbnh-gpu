@@ -3,7 +3,7 @@
 # Same deck, steps and CFL for every code; XBeach time = "MPI timing loop" in XBlog.txt, GPU time = wall
 # time of the time loop (xbgpu_log.txt). Output: <workdir>/benchmark.csv; plot with tools/plot_benchmark.py.
 # Usage: SIZES="600 2400 9600" RANKS="2 4 8 16" TSTOP=30 bash tools/benchmark.sh [workdir]
-# (ny = 33400 gives 8.7 M cells, the size of the Estero Island grid; XBeach MPI needs >= 2 ranks)
+# (ny = 33400 gives 8.7 M cells; XBeach MPI needs >= 2 ranks)
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 W=${1:-$ROOT/benchmark}
@@ -19,7 +19,7 @@ for ny in ${SIZES:-600 2400 9600}; do
   for b in xbnh_gpu xbnh_gpu_sp; do
     d=$W/ny${ny}_$b; rm -rf "$d"; mkdir "$d"; cp "$base"/{params.txt,z.grd,boun_U.bcf} "$d"/
     (cd "$d" && "$ROOT/bin/$b" > out.txt 2>&1)
-    steps=$(awk '/^steps/{print $2}' "$d/xbgpu_log.txt"); wall=$(awk '/^wall_s/{print $2}' "$d/xbgpu_log.txt")
+    steps=$(awk '/^steps/{print $2}' "$d/xbgpu_log.txt"); wall=$(awk '/^loop_s/{print $2}' "$d/xbgpu_log.txt"); [ -n "$wall" ] || wall=$(awk '/^wall_s/{print $2}' "$d/xbgpu_log.txt")
     code=gpu_fp64; [ $b = xbnh_gpu_sp ] && code=gpu_fp32
     echo "$code,$ny,$cells,1,$steps,$wall,$(python -c "print($wall/($steps*$cells))")" >> "$CSV"
     echo "$(date +%T) $code ny=$ny steps=$steps wall=$wall s"

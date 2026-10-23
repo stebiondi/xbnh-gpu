@@ -5,10 +5,10 @@
   "limit": 0.02,
   "source": "XBeach r6167 serial, examples/rip_beach --ny 150 --tstop 120"
  },
- "est": {
+ "cyc": {
   "tspin": 40,
   "Hs_mean_xbeach": 0.69378,
   "limit": 0.03,
-  "source": "XBeach r6167 MPI 2 ranks, examples/estero_features --tstop 100"
+  "source": "XBeach r6167 MPI 2 ranks, examples/cyclic_features --tstop 100"
  }
 }

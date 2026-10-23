@@ -21,21 +21,24 @@
 \newcommand{\code}[1]{\texttt{#1}}
 
 \title{\textbf{xbnh-gpu}\\[4pt]\large XBeach non-hydrostatic on the GPU: installation, use and validation}
-\author{Stefano Biondi}
-\date{Version 1.2, October 2026}
+\author{Stefano Biondi\\[2pt]\small Department of Civil and Coastal Engineering, University of Florida}
+\date{Version 2.0, October 2026}
 
 \begin{document}
 \sloppy
 \maketitle
 
 \begin{abstract}
-\noindent xbnh-gpu is a CUDA implementation of the one-layer non-hydrostatic (phase-resolving) flow solver
-of XBeach (trunk revision 6167). It reads XBeach input decks unchanged and writes XBeach-format output.
-Against Fortran XBeach it reproduces the significant wave height within 0.2\,\% and the mean current
-within 0.6 to 0.8\,\% when compared with serial XBeach. With cyclic lateral boundaries it is as close to
-XBeach MPI as XBeach MPI is to itself at a different number of ranks. On a full Estero Island storm deck
-(8.7 million cells), one RTX~2000 Ada GPU ran 4.1 times (double precision) and 9.5 times (single
-precision) faster than XBeach on 13 CPU cores. This guide explains how to install the code without
+\noindent xbnh-gpu is a CUDA implementation of XBeach (trunk revision 6167) in its non-hydrostatic
+(phase-resolving) mode, \code{wavemodel = nonh}. Version 2 covers every option that XBeach accepts in this
+mode: one-layer and reduced two-layer flow on 1D and 2D grids of any XBeach type, all boundary types,
+spectral wave boundaries, tide, wind, sources, vegetation, groundwater, ships, sediment transport and
+morphology including the gravel formulations of XBeach-G, and Fortran and netCDF output. It reads XBeach
+input decks unchanged and writes the same output files. On 96 feature decks, one per option, 1D runs agree
+with Fortran XBeach to round-off and 2D runs to the tolerance of the iterative pressure solver; with both
+solvers converged to $10^{-11}$, 2D water levels agree to $10^{-13}$. On a rip-channel beach of 0.16 to 8.7
+million cells, one RTX~2000 Ada laptop GPU ran 2.0 to 3.3 times (double precision) and 3.9 to 7.5 times
+(single precision) faster than XBeach with MPI on a 24-core workstation. This guide explains how to install the code without
 administrator rights, build it for any recent NVIDIA GPU, run existing XBeach decks, and verify the
 results against a reference XBeach build that the repository also sets up.
 \end{abstract}
@@ -55,23 +58,36 @@ of a CPU socket.
 xbnh-gpu follows the XBeach Fortran source routine by routine, each routine becoming one or more CUDA
 kernels:
 \begin{itemize}
+\item input, grid and initial state (\code{params.F90}, \code{spaceparams.F90}, \code{initialize.F90});
 \item wet and dry cells and the time step (\code{wetcells.F90}, \code{timestep.F90});
-\item boundary conditions, tide and wind (\code{boundaryconditions.F90}, \code{compute\_tide\_zs0.F90},
-      \code{readwind.F90});
+\item boundary conditions, tide, wind, discharges and rainfall (\code{boundaryconditions.F90},
+      \code{compute\_tide\_zs0.F90}, \code{readwind.F90}, \code{discharge.F90}, \code{rainfall.F90});
+\item spectral wave boundaries (\code{waveparamsnew.F90}, \code{spectral\_wave\_bc\_module.F90}), with the
+      phase-resolved sums and bound long waves on the GPU;
 \item momentum, viscosity and friction (\code{flow\_timestep.F90}, \code{bedroughness.F90});
-\item the non-hydrostatic predictor, breaking and pressure correction (\code{nonh.F90});
-\item second-order advection (\code{flow\_secondorder.F90}).
+\item the non-hydrostatic predictor, breaking and pressure correction (\code{nonh.F90}), one-layer and
+      reduced two-layer;
+\item second-order advection (\code{flow\_secondorder.F90});
+\item vegetation, groundwater, ships and drifters (\code{vegetation.F90}, \code{groundwater.F90},
+      \code{ship.F90}, \code{drifters.F90});
+\item sediment transport, bed update and avalanching (\code{sed\_transport.F90}, \code{morphevolution.F90},
+      \code{bedroughness.F90}, \code{interp.F90});
+\item output (\code{ncoutput.F90}, \code{postprocess.F90}, \code{varianceupdate.F90}).
 \end{itemize}
 Where the Fortran depends on its sequential loop order, the GPU code reproduces the same result. This
-covers the neighbour checks of the breaking switch and two loop variables that XBeach reuses from earlier
-loops when it sets the vertical velocity at points outside the pressure solve.
+covers the neighbour checks of the breaking switch, loop variables that XBeach reuses from earlier loops,
+in-place sweeps such as avalanching (one GPU thread per grid row or column, in XBeach order), and
+single-precision constants in comparisons. Section~\ref{sec:numerics} lists the XBeach behaviours that are
+reproduced on purpose.
 
 There are two intentional differences.
 \begin{enumerate}
 \item \textbf{Pressure solver.} XBeach uses SIP, an incomplete-LU sweep that is sequential by
 construction. xbnh-gpu solves the same five-diagonal system with Jacobi-preconditioned BiCGStab to a
-relative residual of $10^{-3}$ (key \code{gpu\_solver\_acc}). Agreement with XBeach stops improving below
-this tolerance.
+relative residual of $10^{-3}$ (key \code{gpu\_solver\_acc}). In 2D the agreement with XBeach is set by the
+two solver tolerances: with both tightened to $10^{-11}$ (\code{solver\_acc}, \code{gpu\_solver\_acc})
+the codes agree to $10^{-13}$. 1D grids use a direct tridiagonal solve (parallel cyclic reduction), as
+exact as the Fortran Thomas solve, and the same BiCGStab replaces SIP for the 2D groundwater head.
 \item \textbf{Cyclic laterals.} XBeach supports \code{cyclic = 1} only under MPI, where the halo rows
 1--2 and $n_y$--$n_y+1$ are copied from the opposite side of the domain (period $n_y-3$ rows). xbnh-gpu
 keeps the whole domain in one block, makes the same halo copies after every update of a prognostic field,
@@ -183,31 +199,35 @@ Copy the hotstart files rather than linking them: a run that writes hotstart fil
 write through the links into the previous segment. Time restarts from zero in every segment, as in XBeach,
 so the tide, wind and boundary files of each segment start at its own $t = 0$.
 
-\textbf{Spectral wave boundaries.} The GPU code reads a ready nonhydrostatic boundary series
-(\code{wbctype = reuse} or \code{ts\_nonh}) but does not synthesise one from a spectrum. For a deck with
-\code{wbctype = swan}, \code{jonstable} or similar, run the reference XBeach on it once with a short
-\code{tstop} (a few seconds). XBeach writes \code{nhbcflist.bcf} and \code{nh\_series00001.bcf} for the
-whole boundary duration before it starts stepping. Then set \code{wbctype = reuse} for the GPU run. Only the
-offshore boundary matters for this step, so a copy of the deck cut to \code{nx = 4} with the same \code{ny},
-\code{dy} and spectra gives the same series much faster. The synthesis runs on one core; on the Estero deck (5740 boundary rows, 900\,s) it takes one to two hours.
+\textbf{Spectral wave boundaries.} Since version 2 the GPU code synthesises the boundary series from the
+spectra itself (\code{wbctype = parametric, jonstable, swan, vardens}) and writes \code{nhbcflist.bcf} and
+the \code{nh\_series} files as XBeach does, so a later segment can reuse them with \code{wbctype = reuse}.
+The sums over wave components, which take one to two hours on one CPU core for an offshore boundary of
+several thousand rows and a 900\,s segment, run on the GPU. With \code{random = 0} the series are those of XBeach.
 
 \subsection{Output}
+Output follows \code{outputformat}, as in XBeach.
 \begin{itemize}
-\item Global output for each variable listed under \code{nglobalvar} (\code{zs, u, v, uu, vv, ws, wb, hh,
-      pres, breaking, zb, nuh, zs0}): one file \code{<var>.dat}, one float64 record of $(n_x+1)(n_y+1)$
-      values per \code{tintg}, with $i$ (cross-shore) varying fastest. This is the XBeach
-      \code{outputformat = fortran} layout. Read it in Python with
-      \code{np.fromfile('zs.dat','<f8').reshape(-1, ny+1, nx+1)}.
-\item Point output for each point under \code{npoints}: \code{<name>.dat}, one record per \code{tintp} of
-      \code{[t, var1, var2, ...]} in float64. Points snap to the nearest cell centre, as in XBeach.
+\item \code{netcdf}: \code{xboutput.nc} with the dimensions, variables and attributes that XBeach writes
+      (global, point, mean and drifter output, \code{\_parameters}), \code{remdryoutput} and
+      \code{outputprecision}. Build with netCDF (the default when \code{nc-config} is found).
+\item \code{fortran}: for each variable listed under \code{nglobalvar}, one file \code{<var>.dat}, one
+      float64 record of $(n_x+1)(n_y+1)$ values (times the number of layers or fractions) per output time,
+      with $i$ (cross-shore) varying fastest; integer variables as int32. Read it in Python with
+      \code{np.fromfile('zs.dat','<f8').reshape(-1, ny+1, nx+1)}. \code{dims.dat}, \code{xy.dat},
+      \code{<var>\_mean.dat} (and \code{\_var}, \code{\_min}, \code{\_max}) and \code{drifterNNN.dat} as in
+      XBeach.
+\item Point output for each point under \code{npoints}: \code{<name>.dat}, one record per output time of
+      \code{[t, var1, var2, ...]} in float64. Points snap to the nearest cell centre, and runup gauges
+      follow the waterline, as in XBeach. Output times come from \code{tintg}, \code{tintp},
+      \code{tintm} or the lists \code{tsglobal}, \code{tspoints}, \code{tsmean}.
 \item \code{xbgpu\_log.txt}: precision, number of steps, wall time, solver time and iterations, and cost per
       cell and step. Progress goes to standard output every 2000 steps.
 \end{itemize}
 
 \subsection{Single or double precision}
-Single precision is about 2.3 times faster and uses about half the memory. In every test so far it gave
-the same statistics as double precision. On the Estero deck it differed from double precision by 0.5\,\%
-in $H_s$ and 0.001\,m/s in mean current. Consumer GPUs are much slower in double precision than in
+Single precision is about 2.2 times faster and uses about half the memory. In the hydrodynamic tests it
+gave the same statistics as double precision; bed changes differ more (section~\ref{sec:valid}). Consumer GPUs are much slower in double precision than in
 single; data-centre GPUs (A100, H100) are not.
 
 \subsection{GPU-specific keys}
@@ -216,7 +236,7 @@ single; data-centre GPUs (A100, H100) are not.
 \toprule
 Key & Default & Meaning \\
 \midrule
-\code{gpu\_solver\_acc} & 0.001 & relative residual of the BiCGStab pressure solve \\
+\code{gpu\_solver\_acc} & 0.001 & relative residual of the BiCGStab pressure solve (2D) and of the 2D groundwater head solve \\
 \code{gpu\_maxit} & 200 & maximum BiCGStab iterations per step (about 13 are typical) \\
 \code{gpu\_hotstart\_keepuv} & 1 & keep \code{uu, vv} from the hotstart files. Trunk XBeach zeroes them after reading; 0 reproduces that. The reference build here keeps them (section~\ref{sec:xbeach}). \\
 \bottomrule
@@ -230,21 +250,30 @@ XBeach ignores these keys, apart from a warning about unknown parameters.
 \toprule
 Group & Supported \\
 \midrule
-Model & \code{wavemodel = nonh}, \code{nonhq3d = 0}, \code{nhbreaker = 1}, \code{secorder = 1}, Smagorinsky (\code{smag}), Manning (\code{bedfriction = manning}), uniform \code{bedfriccoef} or per-cell \code{bedfricfile} (same layout as the depth file), \code{maxcf}, \code{mincf} \\
-Grid & uniform rectilinear, \code{vardx = 0}, \code{alfa = 0}, $n_y > 4$ \\
-Offshore & \code{front = nonh\_1d}, \code{ARC = 1}; \code{wbctype = ts\_nonh} (\code{boun\_U.bcf}) or \code{reuse} (\code{nhbcflist.bcf}, one entry, scalar or vector file with U, V, Z) \\
+Grid & 1D (\code{ny = 0}) and 2D ($n_y \geq 3$); \code{vardx = 0} or 1 (\code{xfile}, \code{yfile}); \code{alfa}; \code{gridform = delft3d} (\code{xyfile}); \code{posdwn}, \code{xori}, \code{yori}, \code{thetanaut} \\
+Flow & one layer, or reduced two-layer (\code{nonhq3d = 1}, \code{nhlay}); \code{nhbreaker = 0, 1} (2, 3 with XBeach-G); \code{maxbrsteep}, \code{reformsteep}, \code{breakviscfac}; \code{dispc}, \code{Topt}, \code{kdmin}; \code{secorder}, \code{oldhu}, \code{umin}, \code{eps}, \code{epsi}, \code{hmin}, \code{CFL}, \code{maxdtfac}; \code{viscosity}, \code{smag}, \code{nuh}, \code{nuhv}; Coriolis (\code{lat}, \code{wearth}); \code{maxfacg} \\
+Friction & \code{bedfriction = chezy, cf, manning, white-colebrook, white-colebrook-grainsize}; uniform \code{bedfriccoef} or per-cell \code{bedfricfile}; \code{maxcf}, \code{mincf}; \code{friction\_acceleration} (\code{mccall}, \code{nielsen}), \code{friction\_turbulence}, \code{dynamicroughness} \\
+Offshore & \code{front = nonh\_1d}, \code{ARC = 0} or 1; \code{wbctype = params}, \code{ts\_nonh} (U, V, Z, W, dU, dV, Q columns), \code{reuse} (\code{nhbcflist.bcf}, several entries), \code{off}, and the spectral types \code{parametric}, \code{jonstable}, \code{swan}, \code{vardens} (\code{FILELIST}, \code{LOCLIST}, \code{random}, \code{order = 1, 2}, \code{highcomp}, \code{nonhspectrum}) \\
 Back & \code{back = wall}, \code{abs\_1d}, \code{abs\_2d} \\
-Laterals & \code{left}, \code{right} = \code{neumann} or \code{wall}; or \code{cyclic = 1} \\
-Water level & \code{zs0}, or \code{zs0file} with \code{tideloc = 1}; \code{tidetype = velocity} \\
-Wind & \code{windv}, \code{windth}, or \code{windfile} \\
-Restart & read: \code{hotstart = 1}, \code{hotstartfileno}; write: \code{writehotstart = 1} every \code{tinth} (XBeach ASCII format, files numbered from 1) \\
-Output & \code{nglobalvar}, \code{npoints}, \code{tintg}, \code{tintp} (fortran format) \\
+Laterals & \code{left}, \code{right} = \code{neumann}, \code{wall}, \code{no\_advec}, \code{neumann\_v}, \code{abs\_1d}; or \code{cyclic = 1} \\
+Water level & \code{zs0}, \code{zs0file} with \code{tideloc = 0, 1, 2, 4}, \code{paulrevere}, \code{tidetype = velocity, instant}; \code{zsinitfile} \\
+Sources & wind (\code{windv}, \code{windth}, \code{windfile}); point and line discharges; rainfall (constant or file) \\
+Vegetation & \code{vegetation = 1} (several species and sections, bulk drag with $C_d < 0$, \code{veguntow}); porous in-canopy model \code{porcanflow} \\
+Groundwater & \code{gwflow = 1}: hydrostatic or non-hydrostatic head (\code{gwnonh}, \code{gwheadmodel}), laminar or turbulent (\code{gwscheme}), \code{gwhorinfil}, \code{friction\_infiltration}, aquifer and head files \\
+Ships & \code{ships = 1}: ship pressure fields along prescribed tracks, with or without heading, and ship forces \\
+Sediment & \code{sedtrans}, \code{morphology}; \code{form = soulsby\_vanrijn, vanthiel\_vanrijn, vanrijn1993, nielsen2006, mccall\_vanrijn, intrasedtr}; several fractions (\code{ngd}) and bed layers (\code{nd}); \code{lwt}, \code{sourcesink}, \code{fallvelred}, \code{dilatancy}, \code{bermslopetransport}, bed-slope effects; avalanching; \code{struct}, \code{ne\_layer}; \code{morfac}, \code{morfacopt}, \code{morstart}; \code{setbathy}; \code{useXBeachGSettings} \\
+Restart & read: \code{hotstart = 1}, \code{hotstartfileno}; write: \code{writehotstart = 1} every \code{tinth} or at \code{tshotstart} (XBeach ASCII format, files numbered from 1), including sediment and groundwater state \\
+Output & \code{outputformat = fortran, netcdf, debug}; global (grid and per-ship variables such as \code{shipFx}), point, runup-gauge, mean (\code{nmeanvar}) and drifter output; \code{tintg}, \code{tintp}, \code{tintm} or \code{tsglobal}, \code{tspoints}, \code{tsmean}; \code{rotate}; \code{remdryoutput}, \code{outputprecision} \\
 \bottomrule
 \end{tabularx}
 \end{center}
-Not supported: two-layer \code{nonhq3d}, variable or rotated grids, sediment and morphology,
-\code{tideloc} 2 or 4, several \code{nhbcflist} entries, netCDF output, and more than one GPU. Unsupported
-options stop the program with a message instead of being ignored.
+Not supported: wave-action models (\code{wavemodel} other than \code{nonh}); options that need short-wave
+forcing (\code{swrunup}, \code{tidetype = hybrid}, the quasi-3D sediment profile \code{nz > 1});
+\code{gwfastsolve = 1}, which reads an uninitialised index in XBeach r6167; \code{nglobalvar = 999}; and
+more than one GPU. Unsupported options stop the program with a message instead of being ignored. The
+transport formulas \code{mpm}, \code{wilcock\_crow}, \code{engelund\_fredsoe}, \code{wong\_parker},
+\code{fl\_vb} and \code{fredsoe\_deigaard} are accepted by XBeach r6167 but never called, so they give no
+transport in either code.
 
 %=====================================================================================================
 \section{Reference XBeach and tests}\label{sec:xbeach}
@@ -256,19 +285,43 @@ output only. The two patches are:
 \begin{enumerate}
 \item \textbf{Hotstart velocities} (\code{initialize.F90}). Trunk reads \code{uu, vv} from the hotstart
       files and then sets them to zero in \code{flow\_init}, so every restart starts from rest. The patch
-      keeps them. The Estero runs used this build.
+      keeps them.
 \item \textbf{Point output} (\code{postprocess.F90}). A missing comma in a log-message format makes runs
       with output points stop at start-up with ``Missing comma between descriptors''. This happens always
       in the serial build and intermittently under MPI. Only the message format changes.
 \end{enumerate}
 \code{cyclic = 1} needs the MPI build with at least two ranks: \code{mpirun -np 4 \$XBEACH\_MPI}.
 
+\subsection{Feature suite}\label{sec:suite}
+\code{tests/run\_features.sh} builds one small deck per XBeach option (96 decks, listed in
+\code{tests/features/suite.txt} and generated by \code{examples/features/make\_case.py}), runs them on the
+GPU and checks the global output:
+\begin{lstlisting}[language=bash]
+bash tests/run_features.sh                  # GPU only, against stored XBeach statistics, about 5 min
+bash tests/run_features.sh --xbeach -j 8    # also runs every deck in Fortran XBeach, 8 at a time
+bash tests/run_features.sh sed2d gw_nh2d    # selected decks
+\end{lstlisting}
+The base deck is a barred beach 520\,m long at $\Delta x = 2$\,m with 120\,s of irregular waves
+($H_{m0} = 1$\,m, $T_p = 8$\,s); 2D decks have 61 alongshore rows. With \code{--xbeach} the GPU output is
+compared with the XBeach output field by field over $t \geq 40$\,s: relative RMS differences of $H_s$
+(\code{Hs\_rel}), of the mean current (\code{current\_rel}), of the final bed (\code{bed\_rel}) and of
+the sediment concentration (\code{cc\_rel}), and the RMS difference of the instantaneous water level
+(\code{zs\_rms\_m}). Every other output file (extra global variables, point and runup-gauge files, mean
+files, drifters, per-ship forces) is compared as well, by its largest difference relative to its largest
+value (\code{files\_rel}). The limits are $10^{-6}$ for 1D decks, which agree with XBeach to round-off, and
+$2 \times 10^{-3}$ ($H_s$) and $10^{-2}$ (current, bed, concentration) for 2D decks, whose agreement is
+set by the pressure-solver tolerance; \code{files\_rel} has a 2D limit of 0.1, because a maximum over
+all cells and times picks up cells at the waterline that are wet in one code and dry in the other. Without \code{--xbeach} the deck statistics (mean $H_s$, RMS mean
+current, mean water level, RMS bed change, mean concentration) are compared with the XBeach values in
+\code{tests/features/reference.json}, with the same limits.
+
+\subsection{Quick tests}
 \code{tests/run\_tests.sh} runs two small decks on the GPU in both precisions:
 \begin{itemize}
 \item a rip-channel beach (39\,k cells, 120\,s);
-\item the Estero-feature deck (40\,k cells, 100\,s; cyclic laterals, \code{abs\_2d}, vector boundary,
+\item the cyclic-feature deck (40\,k cells, 100\,s; cyclic laterals, \code{abs\_2d}, vector boundary,
       tide and wind files, point output);
-\item a hotstart round trip on the Estero-feature deck: a 40\,s run writes a hotstart, a second run
+\item a hotstart round trip on the cyclic-feature deck: a 40\,s run writes a hotstart, a second run
       restarts from it, and the restarted water level and velocities must match to $10^{-6}$;
 \item a per-cell Manning map: a uniform \code{bedfricfile} of 0.02 must reproduce \code{bedfriccoef = 0.02}
       to round-off ($10^{-9}$).
@@ -289,7 +342,7 @@ are from the RTX~2000 Ada):
    Hs_rel          0.0032  (limit 0.02)  ok
    current_rel     0.0046  (limit 0.1)  ok
    zs_rms_m        0.0029  (limit 0.02)  ok
-== 3. hotstart write and restart (Estero-feature deck)
+== 3. hotstart write and restart (cyclic-feature deck)
  ...
    zs  max difference after restart 5.0e-09  (limit 1e-06)  ok
    uu  max difference after restart 5.0e-09  (limit 1e-06)  ok
@@ -303,7 +356,56 @@ tests passed: 12, failed: 0
 \end{lstlisting}
 
 %=====================================================================================================
-\section{Validation}
+\section{Validation}\label{sec:valid}
+
+\subsection{Feature suite}
+The 96 decks of the feature suite (section~\ref{sec:suite}) were run in Fortran XBeach r6167 (serial) and in
+xbnh-gpu on an RTX~2000 Ada. All pass. Table~\ref{tab:suite} gives the largest and median differences over
+the decks.
+
+\begin{table}[h]\centering\small
+\caption{Feature suite: differences between xbnh-gpu (double precision) and XBeach over 43 1D and 53 2D decks.}\label{tab:suite}
+\begin{tabular}{lcccc}
+\toprule
+Metric & 1D largest & 1D median & 2D largest & 2D median \\
+\midrule
+$H_s$, relative RMS & $5.5\times10^{-15}$ & $1.5\times10^{-15}$ & $4.9\times10^{-4}$ & $1.4\times10^{-5}$ \\
+Mean current, relative RMS & $4.2\times10^{-15}$ & $9.8\times10^{-16}$ & $7.2\times10^{-4}$ & $4.4\times10^{-5}$ \\
+Water level, RMS (m) & $3.4\times10^{-15}$ & $1.4\times10^{-15}$ & $3.7\times10^{-4}$ & $2.4\times10^{-5}$ \\
+Bed level, relative RMS & $5.5\times10^{-13}$ & $9.2\times10^{-14}$ & $2.8\times10^{-4}$ & $8.1\times10^{-5}$ \\
+Concentration, relative RMS & $9.0\times10^{-15}$ & $7.4\times10^{-15}$ & $9.4\times10^{-5}$ & $5.8\times10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In single precision the 1D hydrodynamics agree to $2\times10^{-6}$ and the 2D decks as well as in double
+precision, but the bed change after 120\,s differs by 0.5\,\% in the median deck and by up to 2.5\,\%. Use
+double precision for morphological runs.
+
+\subsection{Solver tolerance}
+The 2D sediment deck of the suite was run in both codes with \code{solver\_acc} and \code{gpu\_solver\_acc}
+set to the same value. The largest difference over the run, relative to the largest value of each field,
+falls in proportion to the tolerance (Table~\ref{tab:tol}): the 2D differences are those of the two
+iterative solvers, not of the implementation.
+
+\begin{table}[h]\centering\small
+\caption{2D sediment deck: largest difference between the codes, relative to the largest value.}\label{tab:tol}
+\begin{tabular}{lcccc}
+\toprule
+Tolerance (both codes) & $z_s$ & $u$ & $c$ & $z_b$ \\
+\midrule
+defaults ($5\times10^{-3}$, 30 it.; $10^{-3}$) & $5.3\times10^{-3}$ & $2.1\times10^{-3}$ & $3.1\times10^{-4}$ & $1.9\times10^{-6}$ \\
+$10^{-3}$ & $1.8\times10^{-3}$ & $9.1\times10^{-4}$ & $2.1\times10^{-4}$ & $4.8\times10^{-8}$ \\
+$10^{-5}$ & $3.8\times10^{-7}$ & $2.1\times10^{-7}$ & $2.3\times10^{-8}$ & $3.4\times10^{-11}$ \\
+$10^{-7}$ & $3.2\times10^{-9}$ & $2.6\times10^{-9}$ & $2.1\times10^{-10}$ & $4.0\times10^{-13}$ \\
+$10^{-9}$ & $3.6\times10^{-11}$ & $1.6\times10^{-11}$ & $1.3\times10^{-12}$ & $2.2\times10^{-15}$ \\
+$10^{-11}$ & $3.3\times10^{-13}$ & $1.2\times10^{-13}$ & $9.3\times10^{-15}$ & $1.1\times10^{-16}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The subsections below are the deck-level validations of version 1; the version-2 code reproduces them (rip-channel beach: $H_s$ 0.01\,\%, mean current 0.01\,\%,
+$z_s$ 0.13\,mm against serial XBeach, because the time step now lands on the output times as in XBeach).
 
 \subsection{Rip-channel beach}
 The deck has 39\,k cells and dx = 2\,m (\code{examples/rip\_beach}):
@@ -333,8 +435,8 @@ Instantaneous $z_s$, RMS difference & 3.5\,mm & 3.6\,mm & 4.1\,mm \\
 currents of both codes; (e, f) water level at the bar crest and in the rip channel.}\label{fig:rip}
 \end{figure}
 
-\subsection{Estero-feature deck}
-\code{examples/estero\_features} combines every option of the Estero Island deck on 40\,k cells:
+\subsection{Cyclic-feature deck}
+\code{examples/cyclic\_features} combines the options of a field-scale storm deck on 40\,k cells:
 \begin{itemize}
 \item cyclic laterals;
 \item a wet \code{abs\_2d} back boundary;
@@ -345,7 +447,7 @@ currents of both codes; (e, f) water level at the bar crest and in the rip chann
 Table~\ref{tab:feat} lists the results.
 
 \begin{table}[h]\centering\small
-\caption{Estero-feature deck (relative RMSE of maps; $z_s$ as RMS difference).}\label{tab:feat}
+\caption{Cyclic-feature deck (relative RMSE of maps; $z_s$ as RMS difference).}\label{tab:feat}
 \begin{tabular}{lcccc}
 \toprule
 Comparison & $H_s$ & Mean current & Longshore current & $z_s$ \\
@@ -357,25 +459,6 @@ XBeach MPI-4 vs MPI-2 (yardstick) & 0.44\,\% & 2.8\,\% & 2.9\,\% & 5.5\,mm \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-\subsection{Estero Island storm deck}
-The full Estero Island deck (Hurricane Ian, 1515 $\times$ 5739 cells at 2\,m) was run for 300\,s from a
-hotstart, with the same input files as XBeach on 13 MPI ranks. At the 50 output points the median
-differences against XBeach were as follows:
-\begin{itemize}
-\item $H_s$: 1.9\,\%;
-\item mean current: 0.002\,m/s, of a median 1.04\,m/s;
-\item maximum speed: 0.8\,\%.
-\end{itemize}
-For scale, the same CPU run with only the wind drag changed differed by 3.4\,\%, 0.19\,m/s and 7.9\,\%
-(Figure~\ref{fig:estero}). Wave phases at individual points begin to separate after about 230\,s, as they
-do between any two XBeach runs with different rank counts.
-
-\begin{figure}[h]\centering
-\includegraphics[width=0.82\textwidth]{estero_T0_gpu_vs_cpu.png}
-\caption{Estero Island deck. (a, b) Water level at two output points; (c) $H_s$ and (d) mean current at
-the 50 points: GPU against XBeach MPI-13, with a CPU wind-drag sensitivity run for scale.}\label{fig:estero}
-\end{figure}
 
 %=====================================================================================================
 \section{Performance}
@@ -390,10 +473,10 @@ alongshore. Figure~\ref{fig:bench} shows the same benchmark.
 \toprule
 Cells & XBeach MPI, best rank count & GPU fp64 & GPU fp32 & Speed-up fp64 / fp32 \\
 \midrule
-0.16\,M & 8.8e-8 (24 ranks) & 4.6e-8 & 2.1e-8 & 1.9 / 4.2 \\
-0.63\,M & 1.0e-7 (32 ranks) & 4.6e-8 & 1.9e-8 & 2.2 / 5.5 \\
-2.5\,M & 1.35e-7 (32 ranks) & 4.4e-8 & 1.9e-8 & 3.1 / 7.1 \\
-8.7\,M & 1.39e-7 (24 ranks) & 4.3e-8 & 1.8e-8 & 3.2 / 7.7 \\
+0.16\,M & 8.8e-8 (24 ranks) & 4.5e-8 & 2.2e-8 & 2.0 / 3.9 \\
+0.63\,M & 1.0e-7 (32 ranks) & 4.5e-8 & 1.9e-8 & 2.3 / 5.3 \\
+2.5\,M & 1.35e-7 (32 ranks) & 4.3e-8 & 1.9e-8 & 3.2 / 6.9 \\
+8.7\,M & 1.39e-7 (24 ranks) & 4.2e-8 & 1.9e-8 & 3.3 / 7.5 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -408,10 +491,9 @@ The scaling has three features worth knowing.
 \begin{itemize}
 \item The CPU stops gaining beyond about 8 ranks, because all cores share the same memory bandwidth.
 \item The GPU cost per cell is flat from 0.16 to 8.7 million cells.
-\item The pressure solve takes about half of the GPU time.
+\item The pressure solve takes about half of the GPU time in fp64 and two thirds in fp32.
 \end{itemize}
-On the Estero Island deck the 300\,s time loop took 121\,min with XBeach on 13 ranks, against 29.3\,min
-(fp64) and 12.8\,min (fp32) on the GPU. A data-centre GPU (A100, H100) is expected to be another 8 to 15
+A data-centre GPU (A100, H100) is expected to be another 8 to 15
 times faster in double precision, but this has not been measured yet.
 
 To reproduce the benchmark:
@@ -423,14 +505,47 @@ python tools/plot_benchmark.py bench/benchmark.csv
 %=====================================================================================================
 \section{Numerical notes}\label{sec:numerics}
 
+\subsection{XBeach behaviours that are reproduced}
+Verification against the Fortran code exposed behaviours of XBeach r6167 that change results. xbnh-gpu
+reproduces them, so that an existing deck gives the XBeach answer, except where the behaviour is a crash or
+reads undefined memory.
+\begin{center}\small
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Area & XBeach r6167 behaviour \\
+\midrule
+\code{ts\_nonh} boundary & The first call of the boundary routine opens \code{boun\_U.bcf} and then advances it, so the first step interpolates between records. \\
+Cell-centre $v_e$ & Lags one flow step (computed before the face velocity is updated); used by output and the canopy model. \\
+1D wind & With \code{ny = 0} the x-directed wind also enters the y-component of the stress, so the stress is $\sqrt{2}$ too large. \\
+Transport formulas & \code{mpm}, \code{wilcock\_crow}, \code{engelund\_fredsoe}, \code{wong\_parker}, \code{fl\_vb} and \code{fredsoe\_deigaard} are accepted but never called: no transport. \\
+Bed load & The bed-load fluxes of the sand formulas are zero in non-hydrostatic mode. \\
+\code{intrasedtr} & The suspended-load adaptation time is never set: bed load only. \\
+\code{nielsen2006} & XBeach stops with a segmentation fault unless \code{streaming = 1}; xbnh-gpu runs with a warning. \\
+Hotstart & Trunk XBeach sets the velocities read from the hotstart files to zero; \code{gpu\_hotstart\_keepuv = 0} reproduces this (default 1 keeps them, as the patched reference build does). \\
+Placeholder defaults & Keys that a deck does not set can keep the value $-123$ and enter the computation, for example \code{tintm} in the weight of the first averaging interval. \\
+2D avalanching & With a time-series boundary \code{Hrms} is not read and stays at $-123$, so the swash excursion that scales the alongshore avalanching flux is undefined; wherever an alongshore slope exceeds the critical slope the whole erodible layer moves in one step and the run fails. Set the boundary with \code{wbctype = params} or a spectrum, or avoid alongshore slopes above \code{wetslp}. \\
+\code{highcomp} & The second-order components take their phases from the frequency bin above each component, a row is cleared when $k_3 h > 5$ at its first entry, and no alongshore flux is added. \\
+\code{gwfastsolve} & Fills its matrix with an uninitialised index; not supported. \\
+Cyclic laterals (MPI) & Velocities are not exchanged after the pressure correction (below); not reproduced. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Other notes}
 \begin{itemize}
+\item \textbf{2D agreement and the solver tolerances.} Both codes stop their pressure iterations when the
+residual falls below a tolerance times the norm of the right-hand side, but SIP and BiCGStab reach different
+errors at the same residual. On steps with a sharp local forcing, such as the first step of a ship
+pressure field, BiCGStab needs a residual two orders of magnitude smaller than SIP for the same accuracy:
+on the ship test deck with waves, both codes at $10^{-11}$ differ by $10^{-6}$, and with
+\code{gpu\_solver\_acc = 1e-13} they agree to $10^{-14}$.
 \item \textbf{Results do not depend on the decomposition.} The GPU domain is a single block, so results
 do not change with core count. XBeach MPI results do: between 2 and 4 ranks, mean currents differ by
 about 3\,\% in the tests above.
 \item \textbf{One cause of the XBeach drift.} XBeach MPI exchanges \code{uu, vv} after the momentum
 equation, the predictor and the second-order advection. It does not exchange them after the pressure
-correction, so at each subdomain seam the continuity equation uses an uncorrected halo velocity. The
-Estero hotstart files show this: their halo rows of \code{vv} differ from the rows they copy by up to
+correction, so at each subdomain seam the continuity equation uses an uncorrected halo velocity. Hotstart
+files written by XBeach MPI on a field-scale deck show this: their halo rows of \code{vv} differ from the rows they copy by up to
 4.6\,cm/s, while \code{zs} matches exactly.
 \item \textbf{Run-to-run reproducibility.} Two runs of xbnh-gpu on the same GPU agree to about
 $10^{-14}$\,m, not bit for bit, because the dot products of the solver are summed with atomic
@@ -464,7 +579,7 @@ Some institutional networks block or inspect traffic to conda-forge. Set the pro
 tests with any Python that has NumPy. \code{env.sh} is then not needed; put \code{bin/} on \code{PATH}
 and set \code{XBNH} to the repository folder.
 \item[No MPI reference XBeach (``no XBeach MPI build found'')]
-The tests then compare the Estero-feature deck with stored XBeach statistics instead, which is enough to
+The tests then compare the cyclic-feature deck with stored XBeach statistics instead, which is enough to
 validate the GPU build. The MPI build needs Open MPI from \code{environment-xbeach.yml}.
 \item[XBeach stops with ``Missing comma between descriptors'']
 This is an unpatched XBeach with output points. Use the build from \code{xbeach/build\_xbeach.sh}.
