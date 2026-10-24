@@ -135,6 +135,11 @@ def stats(run):
 def compare(ref, test):
     """Differences between two runs of the same deck."""
     R, T = ref, test
+    ref_files = {f.name: f for f in R.d.glob("*.dat")}
+    test_files = {f.name: f for f in T.d.glob("*.dat")}
+    if ref_files.keys() != test_files.keys() or any(
+            ref_files[name].stat().st_size != test_files[name].stat().st_size for name in ref_files):
+        return {"finite": False}
     zr, zt = R.load("zs"), T.load("zs")
     if zt is None or not np.isfinite(zt).all():
         return {"finite": False}
