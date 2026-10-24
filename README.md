@@ -39,6 +39,12 @@ To also build the reference Fortran XBeach (serial and MPI) and compare against 
 bash tests/run_features.sh --xbeach -j 8    # runs every deck in XBeach as well, 20-60 min
 ```
 
+The comparison helper tests need only Python and NumPy and do not run either solver:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
 ## Running a model
 
 ```bash

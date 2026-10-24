@@ -16,6 +16,7 @@ compare: differences of the global output over t >= tspin (wet cells away from t
   cc_rel       RMS difference of the sediment concentration, relative to its RMS (when ccg is written)
   files_rel    largest difference in any other output file (extra global variables, points, drifters, ships),
                relative to the largest reference value in that file
+The two runs must have the same .dat filenames and file sizes before their values are compared.
 ref: relative differences of the deck statistics (mean Hs, RMS mean current, mean water level, RMS bed change,
 mean concentration) from the values of XBeach r6167 serial, for machines without a Fortran XBeach build.
 
@@ -137,9 +138,14 @@ def compare(ref, test):
     R, T = ref, test
     ref_files = {f.name: f for f in R.d.glob("*.dat")}
     test_files = {f.name: f for f in T.d.glob("*.dat")}
-    if ref_files.keys() != test_files.keys() or any(
-            ref_files[name].stat().st_size != test_files[name].stat().st_size for name in ref_files):
-        return {"finite": False}
+    errors = [f"missing output: {name}" for name in sorted(ref_files.keys() - test_files.keys())]
+    errors += [f"unexpected output: {name}" for name in sorted(test_files.keys() - ref_files.keys())]
+    for name in sorted(ref_files.keys() & test_files.keys()):
+        expected, actual = ref_files[name].stat().st_size, test_files[name].stat().st_size
+        if actual != expected:
+            errors.append(f"{name}: {actual} bytes, expected {expected}")
+    if errors:
+        return {"finite": False, "errors": errors}
     zr, zt = R.load("zs"), T.load("zs")
     if zt is None or not np.isfinite(zt).all():
         return {"finite": False}
@@ -194,7 +200,8 @@ def compare(ref, test):
 
 
 def judge(vals, lim):
-    bad = [key for key, v in vals.items() if key in lim and not (np.isfinite(v) and v <= lim[key])]
+    bad = list(vals.get("errors", []))
+    bad += [key for key, v in vals.items() if key in lim and not (np.isfinite(v) and v <= lim[key])]
     return (not bad) and vals.get("finite", True), bad
 
 
@@ -212,13 +219,14 @@ def cmd_make(work, names):
 
 def report(rows, title, jsonfile=None):
     if jsonfile:
-        Path(jsonfile).write_text(json.dumps({"title": title, "decks": {name: {"class": cls, "pass": bool(ok), **vals}
-                                                                          for name, cls, vals, ok, _ in rows}}, indent=1) + "\n")
+        Path(jsonfile).write_text(json.dumps({"title": title, "decks": {name: {"class": cls, "pass": bool(ok), **vals,
+                                                                          **({"errors": bad} if bad else {})}
+                                                                          for name, cls, vals, ok, bad in rows}}, indent=1) + "\n")
     print(title)
     npass = 0
     for name, cls, vals, ok, bad in rows:
         txt = "  ".join(f"{k} {v:.1e}" for k, v in vals.items() if isinstance(v, float))
-        print(f"  {name:13s} {cls}  {'PASS' if ok else 'FAIL'}  {txt}" + (f"   (too large: {', '.join(bad)})" if bad else ""))
+        print(f"  {name:13s} {cls}  {'PASS' if ok else 'FAIL'}  {txt}" + (f"   (failed checks: {', '.join(bad)})" if bad else ""))
         npass += ok
     print(f"features passed: {npass} of {len(rows)}")
     return npass == len(rows)
