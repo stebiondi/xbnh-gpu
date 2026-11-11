@@ -202,6 +202,17 @@ struct Params {
     double theta0 = 0;   // s%theta0 from dir0
 };
 
+// grid size of a Delft3D xyfile (header as read by read_delft3d_grid): the ny-dependent defaults need it
+static void delft3d_grid_size(const std::string &fn, int &mmax, int &nmax) {
+    std::ifstream f(fn);
+    if (!f) fail("cannot open xyfile " + fn);
+    std::string line;
+    while (std::getline(f, line)) if (!line.empty() && line[0] != '*') break;   // first non-comment line
+    mmax = 0; nmax = 0;
+    while (std::getline(f, line)) { std::istringstream is(line); if (is >> mmax >> nmax) break; }
+    if (mmax < 2 || nmax < 1) fail("xyfile " + fn + ": cannot read the grid dimensions");
+}
+
 static void read_params(ParFile &F, Params &p) {
     p.useXBeachG = F.integer("useXBeachGSettings", 0);
     const int G = p.useXBeachG;   // XBeach-G preset: changes the defaults below as params.F90 does
@@ -268,6 +279,8 @@ static void read_params(ParFile &F, Params &p) {
         p.depfile = F.name("depfile"); p.xyfile = F.name("xyfile");
         if (p.depfile.empty() || p.xyfile.empty()) fail("gridform = delft3d needs depfile and xyfile");
         p.dx = -1; p.dy = -1;
+        int mmax, nmax; delft3d_grid_size(p.xyfile, mmax, nmax);
+        p.nx = mmax - 1; p.ny = nmax - 1;
     }
     if (p.ny == 1 || p.ny == 2) fail("ny = 1 or 2 is not supported (use ny = 0 for 1D or ny >= 3)");
 

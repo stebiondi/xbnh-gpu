@@ -240,14 +240,17 @@ struct Output {
     }
     void init_fortran() {
         FILE *f = fopen("xy.dat", "wb");
+        if (!f) fail("cannot write xy.dat");
         fwrite(G->xz.data(), 8, N, f); fwrite(G->yz.data(), 8, N, f); fwrite(G->x.data(), 8, N, f); fwrite(G->y.data(), 8, N, f);
         fclose(f);
         for (auto &q : gf) { FILE *g = fopen((q.name + ".dat").c_str(), "wb"); if (!g) fail("cannot write " + q.name + ".dat"); gfiles.push_back(g); }
         for (auto &q : pts) { FILE *g = fopen((q.id + ".dat").c_str(), "wb"); if (!g) fail("cannot write " + q.id + ".dat"); pfiles.push_back(g); }
-        if (P->npoints > 0) { FILE *g = fopen("pointvars.idx", "w"); for (auto &q : pf) fprintf(g, " %s\n", q.name.c_str()); fclose(g); }
+        if (P->npoints > 0) { FILE *g = fopen("pointvars.idx", "w"); if (!g) fail("cannot write pointvars.idx");
+                              for (auto &q : pf) fprintf(g, " %s\n", q.name.c_str()); fclose(g); }
         const char *suf[4] = {"_mean", "_var", "_min", "_max"};
-        for (auto &q : mf) for (int r = 0; r < 4; r++) mfiles[r].push_back(fopen((q.name + suf[r] + ".dat").c_str(), "wb"));
-        for (int q = 1; q <= P->ndrifter; q++) { char b[32]; snprintf(b, sizeof b, "drifter%03d.dat", q); dfiles.push_back(fopen(b, "wb")); }
+        for (auto &q : mf) for (int r = 0; r < 4; r++) { FILE *g = fopen((q.name + suf[r] + ".dat").c_str(), "wb"); if (!g) fail("cannot write " + q.name + suf[r] + ".dat"); mfiles[r].push_back(g); }
+        for (int q = 1; q <= P->ndrifter; q++) { char b[32]; snprintf(b, sizeof b, "drifter%03d.dat", q);
+                                                 FILE *g = fopen(b, "wb"); if (!g) fail(std::string("cannot write ") + b); dfiles.push_back(g); }
     }
     // fill dout with variable `name` (layers stacked); returns false when the variable is not computed (zeros)
     bool produce(const Field &f, int uvzero) {
@@ -502,6 +505,7 @@ struct Output {
         if (P->morfacopt == 1) for (auto &x : ot) x *= std::max(P->morfac, 1.0);
         double h[10] = {(double)nitg, (double)P->nx, (double)P->ny, 1.0, (double)P->kmax, (double)ngd, (double)nd, (double)nitp, 0.0, (double)nitm};
         FILE *f = fopen("dims.dat", "r+b"); if (!f) f = fopen("dims.dat", "wb");
+        if (!f) fail("cannot write dims.dat");
         fseek(f, 0, SEEK_SET);
         fwrite(h, 8, 10, f); fwrite(ot.data(), 8, ot.size(), f);
         fclose(f);

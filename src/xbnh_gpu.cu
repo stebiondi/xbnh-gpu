@@ -292,6 +292,7 @@ int main(int argc, char **argv) {
     std::vector<Ship> ships;
     double *d_xz = nullptr, *d_yz = nullptr, *d_zsv = nullptr, *d_sbuf = nullptr;
     int *d_pairs = nullptr, *d_count = nullptr, *d_sidx = nullptr, pair_cap = 0;
+    size_t sidx_cap = 0;
     if (P.ships) {
         ships = ship_init(P);
         hd.ph = R();
@@ -618,6 +619,7 @@ int main(int argc, char **argv) {
            P.nonhq3d, P.cyclic, P.back, P.wbctype, P.hotstart, P.points.size());
     fflush(stdout);
     FILE *flog = fopen("xbgpu_log.txt", "w");
+    if (!flog) fail("cannot write xbgpu_log.txt");
     long nstep = 0, itsum = 0, itmax = 0, nsolve = 0, nonconv = 0;
     double tsolve = 0, dt = 0, dtref = 0;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
@@ -803,9 +805,9 @@ int main(int argc, char **argv) {
                     S.iref[4 * q] = (int)k1 + 1; S.iref[4 * q + 1] = (int)k2 + 1; S.iref[4 * q + 2] = (int)k3 + 1; S.iref[4 * q + 3] = (int)k4 + 1;
                 }
                 // GRMAP: zs + ph at the ship points (unmapped points keep their value)
-                if (!d_sidx || (int)S.iref.size() > pair_cap) {
+                if (S.iref.size() > sidx_cap) {
                     if (d_sidx) { cudaFree(d_sidx); cudaFree(d_sbuf); }
-                    size_t m = std::max((size_t)pair_cap, S.iref.size()); d_sidx = dalloc<int>(m); d_sbuf = dalloc<double>(m);
+                    sidx_cap = std::max((size_t)pair_cap, S.iref.size()); d_sidx = dalloc<int>(sidx_cap); d_sbuf = dalloc<double>(sidx_cap);
                 }
                 CK(cudaMemcpy(d_sidx, S.iref.data(), S.iref.size() * sizeof(int), cudaMemcpyHostToDevice));
                 k_ship_gather<<<(unsigned)((S.iref.size() + 255) / 256), 256>>>(d_zsv, d_sidx, d_sbuf, (int)S.iref.size());

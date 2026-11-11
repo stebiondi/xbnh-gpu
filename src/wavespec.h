@@ -299,7 +299,6 @@ struct SpectralGen {
             if (r == "FACTOR") found = 1; else if (r == "ZERO  " || r == "NODATA") fail(fn + ": SWAN spectrum has no data (ZERO/NODATA)"); }
         std::getline(f, line); double factor = atof(trim(line).c_str());
         sp.S.assign((size_t)sp.nf * sp.nang, 0);
-        Tok t(fn);   // re-read numerically from the current position: simpler to parse rows by line
         for (int i = 0; i < sp.nf; i++) {
             std::vector<double> row; while ((int)row.size() < sp.nang) { if (!std::getline(f, line)) fail(fn + ": short spectrum"); std::istringstream is(line); double x; while (is >> x) row.push_back(x); }
             for (int ii = 0; ii < sp.nang; ii++) sp.s(i, ii) = row[ii];
