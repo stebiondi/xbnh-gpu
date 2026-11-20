@@ -45,6 +45,7 @@
 #include "k_morph.cuh"
 #include "k_gravel.cuh"
 #include "output.h"
+#include "k_bldg.cuh"
 
 static const char *XBNH_VERSION = "2.0.0";
 
@@ -441,6 +442,8 @@ int main(int argc, char **argv) {
 
     // flow_init
     H2D(hd.zb, toreal(zb));
+    Buildings BL;   // sequential building failure (bldgfile), k_bldg.cuh
+    BL.init(F, P, NX1, NY1, I, zb);
     // tide_init: zsinitfile, or the corner levels at t = 0 spread over the grid (fill_tide_grid)
     if (!P.zsinitfile.empty()) {
         std::vector<double> z0; read_grid_file(P.zsinitfile, NX1, NY1, z0, true); H2D(hd.zs0, toreal(z0));
@@ -595,7 +598,16 @@ int main(int argc, char **argv) {
 
     // hotstart writing (writehotstart): the variables hotstart = 1 reads back
     int hs_count = 0;
+    auto bldg_check = [&](double tt) {
+        BL.check(tt, hd.zs, hd.zb, N, P.eps, [&](real *a, size_t n) { return D2H(a, n); },
+                 [&](real *a, const std::vector<real> &v) { H2D(a, v); });
+    };
+    auto bldg_quick = [&](double tt) {
+        BL.check(tt, hd.zs, hd.zb, N, P.eps, [&](real *a, size_t n) { return D2H(a, n); },
+                 [&](real *a, const std::vector<real> &v) { H2D(a, v); }, true);
+    };
     auto write_hotstart_all = [&](double tt) {
+        if (BL.on) bldg_check(tt);   // removals go into this hotstart
         hs_count++;
         auto wr = [&](const char *nm, real *src) { std::vector<real> a = D2H(src, N); write_hotstart(nm, hs_count, NX1, NY1, a.data(), false); };
         wr("zs", hd.zs); wr("zb", hd.zb); wr("uu", hd.uu); wr("vv", hd.vv); wr("wb", hd.wb); wr("ws", hd.ws);
@@ -713,7 +725,8 @@ int main(int argc, char **argv) {
         }
         {   // nonh_init_wcoef depends only on zs0 and zb: skip the recomputation (exact) when neither can change
             static const bool varies = !P.zs0file.empty() || P.morphology || P.setbathy;
-            if (wo.newwcoef && !q3 && P.dispc <= 0 && varies) init_wcoef();
+            if (!q3 && P.dispc <= 0 && BL.changed) { init_wcoef(); BL.changed = false; }   // a building was removed
+            else if (wo.newwcoef && !q3 && P.dispc <= 0 && varies) init_wcoef();
         }
         // gw_bc
         if (P.gwflow) {
@@ -1065,6 +1078,8 @@ int main(int argc, char **argv) {
             else k_setbathy<<<GG, B>>>(z0d, z1d, t, sb_t[jj - 1], sb_t[jj], 1);
         }
         nstep++;
+        BL.step(t, hd.zs, hd.zb, hd.u, hd.v);
+        if (BL.on && BL.tcheck > 0 && t >= BL.tnextcheck - 1e-9) { bldg_quick(t); while (BL.tnextcheck <= t + 1e-9) BL.tnextcheck += BL.tcheck; }
         // output (outputext)
         out.accumulate(t, dt);
         if (out.output) {
@@ -1083,6 +1098,7 @@ int main(int argc, char **argv) {
         }
     }
     CK(cudaDeviceSynchronize());
+    if (BL.on && BL.tlast < t) bldg_check(t);   // no hotstart at the end of the run: check anyway
     out.close();
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
     double loop = std::chrono::duration<double>(std::chrono::steady_clock::now() - loop0).count();

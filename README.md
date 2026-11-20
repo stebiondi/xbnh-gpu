@@ -59,6 +59,34 @@ GPU-specific keys (optional, in `params.txt`):
 | `gpu_maxit` | 200 | maximum solver iterations per step |
 | `gpu_hotstart_keepuv` | 1 | keep uu, vv from hotstart files (0 reproduces trunk XBeach, which zeroes them) |
 
+### Building failure during the run (optional)
+
+Sequential building failure after Sanderson and Slinn (in preparation), computed on the GPU on the cells
+around each building, so no global water-level output or post-processing is needed. Every `bldg_tint` s the
+depth h at each perimeter cell is sampled; with hbar its centred `bldg_tavg` s moving average, the wave force
+per unit wall width is F = rho g / 2 (h^2 - hbar^2), and its positive part (`bldg_fpos = 1`) is integrated
+over time. A building's impulse is the maximum over its perimeter cells. When it reaches the building's
+threshold, the building is removed: bed to bare earth on its cells, water level to the mean of its wet
+perimeter cells. The solver uses the new bed from the next time step.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `bldgfile` | (off) | grid of failure thresholds, kN hr/m; buildings are 4-connected cells with the same value > 0 |
+| `bldgbarefile` | | bare-earth bed (same grid as the bed); a building stands where the bed is > 1 m above it |
+| `bldg_tcheck` | 0 | check interval, s: buildings fail within `bldg_tcheck` of reaching their threshold. 0: check only at hotstart writes, adding each interval's perimeter maximum (the original 15 min workflow) |
+| `bldg_tint`, `bldg_tavg` | 0.5, 120 | sampling interval and moving-average window, s |
+| `bldg_rho` | 1025 | water density, kg/m3 |
+| `bldg_fpos` | 1 | 1: integrate max(F, 0); 0: signed F |
+| `bldg_state` | `bldg_state.bin` | state carried between hotstart runs (moving-average window, impulses, peaks); read on `hotstart = 1` |
+| `bldg_dump` | 0 | 1: per-cell impulse at every check (`bldg_cells_<n>.txt`), for verification |
+
+Output: `bldg_removed.txt` (time, id, grid i, j, threshold, impulse, cells) and `bldg_impulse.txt` (per
+building: threshold, impulse, standing, and the peaks while standing of the wave force F, the flow drag
+1/2 rho Cd hw |U|^2 with Cd = 2, and the quasi-static load from the water-level difference across the building,
+rho g / 2 (hw_max^2 - hw_min^2) from the 2 min mean level, each in kN/m with its time). hw is the water height
+against the wall: water level at the perimeter cell minus the building's ground elevation (mean bare earth under
+it). Drag and the water-level difference are recorded only; they do not cause failure.
+
 ## Supported XBeach options (`wavemodel = nonh`)
 
 - **Grids:** 1D (`ny = 0`) and 2D; `vardx = 0/1` (`xfile`, `yfile`), `alfa`, `gridform = delft3d`

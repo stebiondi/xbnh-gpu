@@ -7,6 +7,12 @@
 // files and nhbcflist.bcf exactly as XBeach does, so the run reads them back through the reuse code path.
 #pragma once
 #include <complex>
+#include <map>
+#include <chrono>
+static double ws_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 typedef std::complex<double> cplx;
 
 // ---- math_tools.F90 random: Park-Miller minimal standard generator (SAVE seed)
@@ -24,11 +30,14 @@ static double xb_random(int j) {
 static void fft_pow2(std::vector<cplx> &a, bool inv) {
     size_t n = a.size();
     for (size_t i = 1, j = 0; i < n; i++) { size_t bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) std::swap(a[i], a[j]); }
+    thread_local std::vector<cplx> tw;
     for (size_t len = 2; len <= n; len <<= 1) {
         double ang = 2 * M_PI / len * (inv ? 1 : -1);
+        tw.resize(len / 2);
+        for (size_t k = 0; k < len / 2; k++) tw[k] = std::polar(1.0, ang * k);   // same value as computed per butterfly
         for (size_t i = 0; i < n; i += len)
             for (size_t k = 0; k < len / 2; k++) {
-                cplx w = std::polar(1.0, ang * k);
+                const cplx &w = tw[k];
                 cplx u = a[i + k], v = a[i + k + len / 2] * w;
                 a[i + k] = u + v; a[i + k + len / 2] = u - v;
             }
@@ -38,12 +47,21 @@ static std::vector<cplx> ifft_unnorm(const std::vector<cplx> &x) {
     size_t n = x.size();
     if ((n & (n - 1)) == 0) { std::vector<cplx> a = x; fft_pow2(a, true); return a; }
     size_t m = 1; while (m < 2 * n - 1) m <<= 1;
-    std::vector<cplx> w(n), a(m, 0), b(m, 0);
-    for (size_t k = 0; k < n; k++) { double t = M_PI * (double)((k * k) % (2 * n)) / n; w[k] = std::polar(1.0, t); }   // exp(+i pi k^2/n)
+    // chirp w and FFT(b) depend on n only: cached per thread (identical values to recomputing them)
+    thread_local std::map<size_t, std::pair<std::vector<cplx>, std::vector<cplx>>> cache;
+    auto it_ = cache.find(n);
+    if (it_ == cache.end()) {
+        std::vector<cplx> w(n), b(m, 0);
+        for (size_t k = 0; k < n; k++) { double t = M_PI * (double)((k * k) % (2 * n)) / n; w[k] = std::polar(1.0, t); }   // exp(+i pi k^2/n)
+        b[0] = std::conj(w[0]);
+        for (size_t k = 1; k < n; k++) b[k] = b[m - k] = std::conj(w[k]);
+        fft_pow2(b, false);
+        it_ = cache.emplace(n, std::make_pair(std::move(w), std::move(b))).first;
+    }
+    const std::vector<cplx> &w = it_->second.first, &b = it_->second.second;
+    std::vector<cplx> a(m, 0);
     for (size_t k = 0; k < n; k++) a[k] = x[k] * w[k];
-    b[0] = std::conj(w[0]);
-    for (size_t k = 1; k < n; k++) b[k] = b[m - k] = std::conj(w[k]);
-    fft_pow2(a, false); fft_pow2(b, false);
+    fft_pow2(a, false);
     for (size_t k = 0; k < m; k++) a[k] *= b[k];
     fft_pow2(a, true);
     std::vector<cplx> out(n);
@@ -61,34 +79,74 @@ __global__ void k_swts(SwtsArgs a, const double *A, const double *w, const doubl
     int j = (int)(idx % a.NY1), it = (int)(idx / a.NY1);
     double t = tin[it], z = 0, U = 0, V = 0, dU = 0, dV = 0;
     double zz = -1 * (a.h0 - a.nhlay * a.h0);
-    for (int ik = 0; ik < a.K; ik++) {
-        double arg = w[ik] * t - kk[ik] * (sin(th[ik]) * dy[j] + cos(th[ik]) * dx[j]) + ph[ik];
-        z = z + A[(size_t)ik * a.NY1 + j] * sin(arg);
-    }
+    const double *sth = th + a.K, *cth = th + 2 * a.K;   // sin(th), cos(th), filled by k_swts_trig
+    double dyj = dy[j], dxj = dx[j];
     for (int ik = 0; ik < a.K; ik++) {
         double Ajk = A[(size_t)ik * a.NY1 + j];
-        double arg = w[ik] * t - kk[ik] * (sin(th[ik]) * dy[j] + cos(th[ik]) * dx[j]) + ph[ik];
+        double sa = sin(w[ik] * t - kk[ik] * (sth[ik] * dyj + cth[ik] * dxj) + ph[ik]);
+        z = z + Ajk * sa;
         if (a.q3) {
-            double u1 = w[ik] * Ajk / (sinh(kk[ik] * a.h0) * kk[ik]) * (sinh(kk[ik] * (zz + a.h0))) * sin(arg);
+            double u1 = w[ik] * Ajk / (sinh(kk[ik] * a.h0) * kk[ik]) * (sinh(kk[ik] * (zz + a.h0))) * sa;
             u1 = u1 / (a.h0 + zz);
-            double u2 = w[ik] * Ajk / (sinh(kk[ik] * a.h0) * kk[ik]) * (sinh(kk[ik] * (0 + a.h0)) - sinh(kk[ik] * (zz + a.h0))) * sin(arg);
+            double u2 = w[ik] * Ajk / (sinh(kk[ik] * a.h0) * kk[ik]) * (sinh(kk[ik] * (0 + a.h0)) - sinh(kk[ik] * (zz + a.h0))) * sa;
             u2 = u2 / (zz * -1);
             double Uk = a.nhlay * u1 + (1 - a.nhlay) * u2, dUk = u1 - u2;
-            U = U + cos(th[ik]) * Uk; V = V + sin(th[ik]) * Uk;
-            dU = dU + cos(th[ik]) * dUk; dV = dV + sin(th[ik]) * dUk;
+            U = U + cth[ik] * Uk; V = V + sth[ik] * Uk;
+            dU = dU + cth[ik] * dUk; dV = dV + sth[ik] * dUk;
         } else {
-            double Uk = 1.0 / a.h0 * w[ik] * Ajk * sin(arg) * 1.0 / kk[ik];
-            U = U + cos(th[ik]) * Uk; V = V + sin(th[ik]) * Uk;
+            double Uk = 1.0 / a.h0 * w[ik] * Ajk * sa * 1.0 / kk[ik];
+            U = U + cth[ik] * Uk; V = V + sth[ik] * Uk;
         }
     }
     size_t o = (size_t)it * a.NY1 + j;
     zs[o] = z; u[o] = U; v[o] = V; du[o] = dU; dv[o] = dV;
 }
 
+__global__ void k_swts_trig(int K, double *th) {   // th[0..K) -> th[K..2K) = sin, th[2K..3K) = cos
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < K) { th[K + i] = sin(th[i]); th[2 * K + i] = cos(th[i]); }
+}
+// j-independent factors of k_qbcf_gn: cos/sin(-dphi3), cg3 cos(th3), cg3 sin(th3) (same expressions, same bits)
+__global__ void k_qbcf_pre(size_t n, const double *dphi3, const double *cg3, const double *th3, double *pre) {
+    size_t q = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= n) return;
+    pre[q] = cos(-dphi3[q]); pre[n + q] = sin(-dphi3[q]);
+    pre[2 * n + q] = cg3[q] * cos(th3[q]); pre[3 * n + q] = cg3[q] * sin(th3[q]);
+}
+
+// all rows j0 .. j0+nj-1 in one launch (blockIdx.y = row); per-thread arithmetic identical to k_qbcf_gn
+__global__ void k_qbcf_gn_rows(int K, int NY1, int j0, int nj, double dfgen, const double *dxa, const double *dya,
+                               const double *D, const double *Sq, const double *pre, const double *cg3,
+                               const double *KKx, const double *KKy, double *outall) {
+    int m = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int jr = blockIdx.y;
+    if (m > K - 1 || jr >= nj) return;
+    int j = j0 + jr;
+    double dyj = dya[j], dxj = dxa[j];
+    const size_t n = (size_t)(K - 1) * K;
+    double sr[4] = {0, 0, 0, 0}, si[4] = {0, 0, 0, 0};
+    for (int k = 1; k <= K; k++) {
+        size_t q = (size_t)(m - 1) + (size_t)(K - 1) * (k - 1);
+        double Ef = 0;
+        if (k <= K - m) Ef = 2 * D[q] * D[q] * Sq[(size_t)(k - 1) * NY1 + j] * Sq[(size_t)(k + m - 1) * NY1 + j] * dfgen;
+        double Ab = sqrt(2 * Ef * dfgen) * (D[q] >= 0 ? 1.0 : -1.0);
+        double er = Ab / 2 * pre[q], ei = Ab / 2 * pre[n + q];
+        double ph = -(KKy[q] * dyj + KKx[q] * dxj), pr = cos(ph), pi_ = sin(ph);
+        double f[4] = {pre[2 * n + q], pre[3 * n + q], cg3[q], 1.0};
+        for (int iq = 0; iq < 4; iq++) {
+            double ar = er * f[iq], ai = ei * f[iq];
+            sr[iq] += ar * pr - ai * pi_; si[iq] += ar * pi_ + ai * pr;
+        }
+    }
+    double *out = outall + (size_t)jr * 8 * (K - 1);
+    for (int iq = 0; iq < 4; iq++) { out[(size_t)iq * 2 * (K - 1) + 2 * (m - 1)] = sr[iq]; out[(size_t)iq * 2 * (K - 1) + 2 * (m - 1) + 1] = si[iq]; }
+}
+
 // generate_qbcf: Gn(m+1) = sum_k Ftemp(m,k,iq) exp(-i (KKy dy_j + KKx dx_j)) for one offshore point j, iq = 1..4
 __global__ void k_qbcf_gn(int K, int NY1, int j, double dfgen, double dyj, double dxj, const double *D, const double *Sq,
-                          const double *dphi3, const double *cg3, const double *th3, const double *KKx, const double *KKy,
+                          const double *pre, const double *cg3, const double *KKx, const double *KKy,
                           double *out) {
+    const size_t n = (size_t)(K - 1) * K;
     int m = blockIdx.x * blockDim.x + threadIdx.x + 1;
     if (m > K - 1) return;
     double sr[4] = {0, 0, 0, 0}, si[4] = {0, 0, 0, 0};
@@ -97,9 +155,9 @@ __global__ void k_qbcf_gn(int K, int NY1, int j, double dfgen, double dyj, doubl
         double Ef = 0;
         if (k <= K - m) Ef = 2 * D[q] * D[q] * Sq[(size_t)(k - 1) * NY1 + j] * Sq[(size_t)(k + m - 1) * NY1 + j] * dfgen;
         double Ab = sqrt(2 * Ef * dfgen) * (D[q] >= 0 ? 1.0 : -1.0);
-        double er = Ab / 2 * cos(-dphi3[q]), ei = Ab / 2 * sin(-dphi3[q]);     // Abnd/2*exp(-i dphi3)
+        double er = Ab / 2 * pre[q], ei = Ab / 2 * pre[n + q];     // Abnd/2*exp(-i dphi3)
         double ph = -(KKy[q] * dyj + KKx[q] * dxj), pr = cos(ph), pi_ = sin(ph);
-        double f[4] = {cg3[q] * cos(th3[q]), cg3[q] * sin(th3[q]), cg3[q], 1.0};
+        double f[4] = {pre[2 * n + q], pre[3 * n + q], cg3[q], 1.0};
         for (int iq = 0; iq < 4; iq++) {
             double ar = er * f[iq], ai = ei * f[iq];
             sr[iq] += ar * pr - ai * pi_; si[iq] += ar * pi_ + ai * pr;
@@ -480,7 +538,9 @@ struct SpectralGen {
             p.Trep = cs.trep; p.Hrms = cs.hm0 / sqrt(2.0);
             printf("  overall Trep %.2f s\n", p.Trep);
             Wave w = make_wave(cs, h0, rtbc, dtbc, specin, specint);
+            double t0w = ws_now();
             write_nh(w, nhname, t, dt);
+            printf("  timing: write %.1f s\n", ws_now() - t0w); fflush(stdout);
             rtbc_local = w.rtbc; dtbc_local = w.dtbc; maindir_local = cs.dir0;
         }
         // generate_admin_files
@@ -503,6 +563,7 @@ struct SpectralGen {
     Wave make_wave(const SpecIn &cs, double h0, double rtbc, double dtbc, std::vector<SpecIn> &specin, std::vector<SpecIn> &specint) {
         Params &p = *P;
         Wave w; w.h0 = h0; w.rtbc = rtbc; w.dtbc = dtbc;
+        double tc0 = ws_now();
         // generate_wavetrain_components
         double kmax = WDMAX / h0, fmax = p.g * kmax * tanh(kmax * h0) / 2 / M_PI;
         int i1 = 0, i2 = 0;
@@ -628,10 +689,15 @@ struct SpectralGen {
         }
         if (p.nspr == 1) for (auto &x : w.thetagen) x = (x >= -M_PI && x < M_PI) || x == M_PI ? 0.0 : -M_PI;
         // generate_swts on the GPU (bclwonly = 1: no phase-resolved waves, bound long waves only)
+        double t0 = ws_now();
+        printf("  K %d, tslen %d, boundary points %d\n", K, w.tslen, NY1);
         if (p.bclwonly == 0) synth(w);
         else { size_t M = (size_t)NY1 * w.tslen; for (auto *v : {&w.zs, &w.u, &w.v, &w.du, &w.dv}) v->assign(M, 0.0); }
+        double t1 = ws_now();
         if (p.order > 1) qbcf(w);
+        double t2 = ws_now();
         if (p.highcomp == 1 && p.order > 1) secondorder(w);
+        printf("  timing: components %.1f s, synthesis %.1f s, bound long waves %.1f s, second order %.1f s\n", t0 - tc0, t1 - t0, t2 - t1, ws_now() - t2); fflush(stdout);
         return w;
     }
     void synth(Wave &w) {
@@ -640,7 +706,9 @@ struct SpectralGen {
         std::vector<double> dx(NY1), dy(NY1);
         for (int j = 1; j <= NY1; j++) { dx[j - 1] = G->xz[G->I(1, j)] - G->xz[G->I(1, 1)]; dy[j - 1] = G->yz[G->I(1, j)] - G->yz[G->I(1, 1)]; }
         auto up = [](const std::vector<double> &h) { double *d_; CK(cudaMalloc(&d_, std::max<size_t>(1, h.size()) * 8)); CK(cudaMemcpy(d_, h.data(), h.size() * 8, cudaMemcpyHostToDevice)); return d_; };
-        double *dA = up(w.A), *dw = up(w.wgen), *dk = up(w.kgen), *dt_ = up(w.thetagen), *dph = up(w.phigen), *dtin = up(w.tin), *ddx = up(dx), *ddy = up(dy);
+        std::vector<double> th3k(3 * (size_t)K, 0.0); std::copy(w.thetagen.begin(), w.thetagen.end(), th3k.begin());
+        double *dA = up(w.A), *dw = up(w.wgen), *dk = up(w.kgen), *dt_ = up(th3k), *dph = up(w.phigen), *dtin = up(w.tin), *ddx = up(dx), *ddy = up(dy);
+        k_swts_trig<<<(K + 127) / 128, 128>>>(K, dt_);
         size_t M = (size_t)NY1 * w.tslen;
         double *o[5];
         for (int q = 0; q < 5; q++) CK(cudaMalloc(&o[q], M * 8));
@@ -686,16 +754,36 @@ struct SpectralGen {
         }
         for (size_t q = 0; q < th3.size(); q++) th3[q] = atan2(KKy[q], KKx[q]);
         std::vector<double> qv((size_t)NY1 * w.tslen * 4, 0);   // q(j,it,iq) -> [(iq*tslen + it)*NY1 + j]
-        std::vector<cplx> Gn(w.tslen, 0);
         auto up = [](const std::vector<double> &h) { double *d_; CK(cudaMalloc(&d_, std::max<size_t>(1, h.size()) * 8)); CK(cudaMemcpy(d_, h.data(), h.size() * 8, cudaMemcpyHostToDevice)); return d_; };
         double *dD = up(D), *dS = up(p.Sfold == 1 ? w.Sfinterpq : w.Sfinterp), *dph = up(dphi3), *dcg = up(cg3), *dth3 = up(th3),
                *dkx = up(KKx), *dky = up(KKy), *dout;
         CK(cudaMalloc(&dout, (size_t)8 * 2 * std::max(1, K - 1) * 8));
-        std::vector<double> gn((size_t)8 * std::max(1, K - 1));
+        const size_t nq_ = (size_t)(K - 1) * K;
+        double *dpre; CK(cudaMalloc(&dpre, std::max<size_t>(1, 4 * nq_) * 8));
+        if (nq_) k_qbcf_pre<<<(unsigned)((nq_ + 255) / 256), 256>>>(nq_, dph, dcg, dth3, dpre);
+        const size_t GNL = (size_t)8 * std::max(1, K - 1);
+        std::vector<double> gall(GNL * NY1);
+        {   // offsets of the offshore points (same expressions as before), then rows in blocks of up to 512
+            std::vector<double> dxa(NY1), dya(NY1);
+            for (int j = 1; j <= NY1; j++) { dxa[j - 1] = G->xz[G->I(1, j)] - G->xz[G->I(1, 1)]; dya[j - 1] = G->yz[G->I(1, j)] - G->yz[G->I(1, 1)]; }
+            double *ddx = up(dxa), *ddy = up(dya), *dblk;
+            const int RB = 512;
+            CK(cudaMalloc(&dblk, GNL * RB * 8));
+            for (int j0 = 0; j0 < NY1; j0 += RB) {
+                int nj = std::min(RB, NY1 - j0);
+                dim3 grid((K - 1 + 127) / 128, nj);
+                k_qbcf_gn_rows<<<grid, 128>>>(K, NY1, j0, nj, w.dfgen, ddx, ddy, dD, dS, dpre, dcg, dkx, dky, dblk);
+                CK(cudaGetLastError());
+                CK(cudaMemcpy(&gall[GNL * j0], dblk, GNL * nj * 8, cudaMemcpyDeviceToHost));
+            }
+            for (double *pp : {ddx, ddy, dblk}) CK(cudaFree(pp));
+        }
+        #pragma omp parallel
+        {
+        std::vector<cplx> Gn(w.tslen, 0);
+        #pragma omp for schedule(dynamic, 8)
         for (int j = 1; j <= NY1; j++) {
-            double dxj = G->xz[G->I(1, j)] - G->xz[G->I(1, 1)], dyj = G->yz[G->I(1, j)] - G->yz[G->I(1, 1)];
-            k_qbcf_gn<<<(K - 1 + 127) / 128, 128>>>(K, NY1, j - 1, w.dfgen, dyj, dxj, dD, dS, dph, dcg, dth3, dkx, dky, dout);
-            CK(cudaMemcpy(gn.data(), dout, (size_t)8 * (K - 1) * 8, cudaMemcpyDeviceToHost));
+            const double *gn = &gall[GNL * (j - 1)];
             for (int iq = 0; iq < 4; iq++) {
                 std::fill(Gn.begin(), Gn.end(), cplx(0, 0));
                 for (int m = 1; m <= K - 1; m++) Gn[m] = cplx(gn[(size_t)iq * 2 * (K - 1) + 2 * (m - 1)], gn[(size_t)iq * 2 * (K - 1) + 2 * (m - 1) + 1]);
@@ -704,7 +792,8 @@ struct SpectralGen {
                 for (int it = 0; it < w.tslen; it++) qv[((size_t)iq * w.tslen + it) * NY1 + j - 1] = o[it].real() * w.taperf[it];
             }
         }
-        for (double *pp : {dD, dS, dph, dcg, dth3, dkx, dky, dout}) CK(cudaFree(pp));
+        }
+        for (double *pp : {dD, dS, dph, dcg, dth3, dkx, dky, dout, dpre}) CK(cudaFree(pp));
         if (p.wbcRemoveStokes == 1) {
             int nin = (int)lround(w.rtbc / w.dtin);
             for (int iq = 0; iq < 4; iq++) for (int j = 0; j < NY1; j++) {
@@ -764,14 +853,19 @@ struct SpectralGen {
             }
         }
         for (size_t q = 0; q < NE; q++) th3[q] = atan2(KKy[q], KKx[q]);
-        std::vector<cplx> E1(NE), E2(NE);
+        std::vector<cplx> E1(NE);
         for (size_t q = 0; q < NE; q++) E1[q] = std::exp(cplx(0, -1) * dphi3[q]);
         const int nq = q3 ? 6 : 4;
         std::vector<double> qv((size_t)nq * w.tslen * NY1, 0);
-        std::vector<cplx> Gn(w.tslen, cplx(0, 0));   // never reset between components or rows, as in XBeach
-        std::vector<double> Ef(NE), qx1, qx2, qy1, qy2;
-        double z = 0;
+        // XBeach never resets Gn between components or rows; every entry read back is rewritten in the same
+        // iteration (all rows m, then the conjugate mirror) or never written (0), so a per-thread Gn is identical
+        const double z = p.nonhq3d == 1 ? -1 * (w.h0 - p.nhlay * w.h0) : 0.0;
         const std::vector<double> &Sf = p.Sfold == 1 ? w.Sfinterpq : w.Sfinterp;
+        #pragma omp parallel
+        {
+        std::vector<cplx> Gn(w.tslen, cplx(0, 0)), E2(NE);
+        std::vector<double> Ef(NE), qx1, qx2, qy1, qy2;
+        #pragma omp for schedule(dynamic, 4)
         for (int j = 1; j <= NY1; j++) {
             std::fill(Ef.begin(), Ef.end(), 0.0);
             if (q3) { qx1.assign(NE, 0); qx2.assign(NE, 0); qy1.assign(NE, 0); qy2.assign(NE, 0); }
@@ -781,7 +875,6 @@ struct SpectralGen {
                     size_t q = IX(m, ii);
                     Ef[q] = D[q] * D[q] * Sf[(size_t)(ii - 1) * NY1 + (j - 1)] * Sf[(size_t)(jj - 1) * NY1 + (j - 1)] * w.dfgen;
                     if (p.nonhq3d == 1) {
-                        z = -1 * (w.h0 - p.nhlay * w.h0);
                         qx1[q] = sinh(KKx[q] * (z + w.h0)) / sinh(KKx[q] * w.h0);
                         qx2[q] = (sinh(KKx[q] * w.h0) - sinh(KKx[q])) / sinh(KKx[q] * w.h0);
                         qy1[q] = sinh(KKy[q] * (z + w.h0)) / sinh(KKy[q] * w.h0);
@@ -824,6 +917,7 @@ struct SpectralGen {
                 for (int it = 0; it < w.tslen; it++) qv[((size_t)iq * w.tslen + it) * NY1 + j - 1] = o[it].real() * w.taperf[it];
             }
         }
+        }
         for (int it = 0; it < w.tslen; it++) for (int j = 0; j < NY1; j++) {
             size_t k = (size_t)it * NY1 + j;
             auto Q = [&](int iq) { return qv[((size_t)iq * w.tslen + it) * NY1 + j]; };
@@ -853,17 +947,26 @@ struct SpectralGen {
             if (abs(e) < 100) snprintf(b, 24, "   %s0.%09dE%c%02d", v < 0 ? "-" : " ", (int)m, e < 0 ? '-' : '+', abs(e) % 100);
             else snprintf(b, 24, "   %s0.%09d%c%03d", v < 0 ? "-" : " ", (int)m, e < 0 ? '-' : '+', abs(e) % 1000);
         };
-        char b[24];
-        std::string line;
-        auto row = [&](double tt, int it) {
-            line.clear(); e18(tt, b); line += b;
+        auto fmt = [&](double tt, int it, std::string &line) {
+            char b[24];
+            line.clear(); line.reserve((size_t)19 * (5 * NY1 + 1) + 1); e18(tt, b); line += b;
             const std::vector<double> *a[5] = {&w.u, &w.v, &w.zs, &w.du, &w.dv};
             for (int q = 0; q < 5; q++) for (int j = 0; j < NY1; j++) { e18((*a[q])[(size_t)it * NY1 + j], b); line += b; }
-            line += '\n'; fputs(line.c_str(), f);
+            line += '\n';
         };
-        row(t - dt * p.maxdtfac, 0);
-        for (int it = 0; it < w.tslen; it++) row(w.tin[it] + t - dt, it);
-        if (w.tin[w.tslen - 1] < w.rtbc + dt * p.maxdtfac) row(w.tin[w.tslen - 1] + t + dt * p.maxdtfac, w.tslen - 1);
+        // rows: (time, index) in file order
+        std::vector<std::pair<double, int>> rows;
+        rows.push_back({t - dt * p.maxdtfac, 0});
+        for (int it = 0; it < w.tslen; it++) rows.push_back({w.tin[it] + t - dt, it});
+        if (w.tin[w.tslen - 1] < w.rtbc + dt * p.maxdtfac) rows.push_back({w.tin[w.tslen - 1] + t + dt * p.maxdtfac, w.tslen - 1});
+        const int CH = 256;
+        std::vector<std::string> buf(CH);
+        for (size_t r0 = 0; r0 < rows.size(); r0 += CH) {
+            int nr = (int)std::min<size_t>(CH, rows.size() - r0);
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (int r = 0; r < nr; r++) fmt(rows[r0 + r].first, rows[r0 + r].second, buf[r]);
+            for (int r = 0; r < nr; r++) fwrite(buf[r].data(), 1, buf[r].size(), f);
+        }
         fclose(f);
     }
 };
