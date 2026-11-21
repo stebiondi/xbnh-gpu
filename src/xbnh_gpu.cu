@@ -46,6 +46,7 @@
 #include "k_gravel.cuh"
 #include "output.h"
 #include "k_bldg.cuh"
+#include "k_pts.cuh"
 
 static const char *XBNH_VERSION = "2.0.0";
 
@@ -444,6 +445,8 @@ int main(int argc, char **argv) {
     H2D(hd.zb, toreal(zb));
     Buildings BL;   // sequential building failure (bldgfile), k_bldg.cuh
     BL.init(F, P, NX1, NY1, I, zb);
+    Gauges GP;      // elevated-building point gauges (ptsfile), k_pts.cuh
+    GP.init(F, P, NX1, NY1, I);
     // tide_init: zsinitfile, or the corner levels at t = 0 spread over the grid (fill_tide_grid)
     if (!P.zsinitfile.empty()) {
         std::vector<double> z0; read_grid_file(P.zsinitfile, NX1, NY1, z0, true); H2D(hd.zs0, toreal(z0));
@@ -608,6 +611,7 @@ int main(int argc, char **argv) {
     };
     auto write_hotstart_all = [&](double tt) {
         if (BL.on) bldg_check(tt);   // removals go into this hotstart
+        GP.write(tt);
         hs_count++;
         auto wr = [&](const char *nm, real *src) { std::vector<real> a = D2H(src, N); write_hotstart(nm, hs_count, NX1, NY1, a.data(), false); };
         wr("zs", hd.zs); wr("zb", hd.zb); wr("uu", hd.uu); wr("vv", hd.vv); wr("wb", hd.wb); wr("ws", hd.ws);
@@ -1079,6 +1083,7 @@ int main(int argc, char **argv) {
         }
         nstep++;
         BL.step(t, hd.zs, hd.zb, hd.u, hd.v);
+        GP.step(t, dt, hd.zs, hd.zb, hd.u, hd.v);
         if (BL.on && BL.tcheck > 0 && t >= BL.tnextcheck - 1e-9) { bldg_quick(t); while (BL.tnextcheck <= t + 1e-9) BL.tnextcheck += BL.tcheck; }
         // output (outputext)
         out.accumulate(t, dt);
@@ -1099,6 +1104,7 @@ int main(int argc, char **argv) {
     }
     CK(cudaDeviceSynchronize());
     if (BL.on && BL.tlast < t) bldg_check(t);   // no hotstart at the end of the run: check anyway
+    if (GP.on && GP.tlast < t) GP.write(t);
     out.close();
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
     double loop = std::chrono::duration<double>(std::chrono::steady_clock::now() - loop0).count();
