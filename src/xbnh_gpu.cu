@@ -1083,7 +1083,7 @@ int main(int argc, char **argv) {
         }
         nstep++;
         BL.step(t, hd.zs, hd.zb, hd.u, hd.v);
-        GP.step(t, dt, hd.zs, hd.zb, hd.u, hd.v);
+        GP.step(t, dt, hd.zs, hd.zb, hd.u, hd.v, hd.ws);
         if (BL.on && BL.tcheck > 0 && t >= BL.tnextcheck - 1e-9) { bldg_quick(t); while (BL.tnextcheck <= t + 1e-9) BL.tnextcheck += BL.tcheck; }
         // output (outputext)
         out.accumulate(t, dt);

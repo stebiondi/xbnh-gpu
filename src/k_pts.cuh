@@ -11,6 +11,17 @@
 //   zs, h = zs - zb, U = |cell-centre velocity| (only where h >= pts_hmin), Fr = U / sqrt(g h), h U^2, h U
 //   e_b = zs - z_beam (wet cells only, h > 1 mm): peak, integral of max(e_b, 0) dt (m s; times rho g it is the uplift pressure impulse per
 //         unit plan area), time above, first time above; the same for e_f = zs - z_floor
+// Deck impact (slamming) at the beam level, at every upcrossing of z_beam by the water surface (a dry cell counts as
+// water at the ground, so a bore that wets the cell and reaches the deck in one step is an impact; none where the ground
+// is at or above z_beam):
+//   ws_imp : peak upward surface velocity at contact (non-hydrostatic surface w, m/s); slamming pressure
+//            p_s = 1/2 rho C_s ws^2 (C_s from the literature, applied in the analysis, not here)
+//   dz_imp : peak rate of rise dzs/dt at contact (m/s), the same from the water level (check on ws; also valid
+//            in hydrostatic runs where ws is 0)
+//   n_imp  : number of impacts; w2_imp: sum of ws^2 over the impacts (m2/s2; repeated-load dose)
+//   U_beam : peak horizontal speed while the water is above z_beam (m/s)
+//   F_face : peak U^2 min(e_b, z_floor - z_beam) (m3/s2): horizontal momentum flux on the face of the floor system
+//            (times 1/2 rho C_d it is the horizontal deck force per unit width)
 // Every pts_tint s (0.5): the trailing pts_tavg s (120) mean water level; its peak = surge + setup without crests.
 // Times are storm seconds (since the cold start, carried over between segments through pts_state).
 // Output pts_peaks.txt (rewritten at every hotstart write and at the end), state pts_state (binary).
@@ -20,17 +31,20 @@
 #include <cmath>
 
 enum { PQ_ZS, PQ_ZS_T, PQ_ZM, PQ_ZM_T, PQ_H, PQ_H_T, PQ_U, PQ_U_T, PQ_FR, PQ_FR_T, PQ_HU2, PQ_HU2_T, PQ_HU, PQ_HU_T,
-       PQ_EB, PQ_EB_T, PQ_EB_INT, PQ_EB_DUR, PQ_EB_FIRST, PQ_EF, PQ_EF_T, PQ_EF_INT, PQ_EF_DUR, PQ_EF_FIRST, PQ_N };
+       PQ_EB, PQ_EB_T, PQ_EB_INT, PQ_EB_DUR, PQ_EB_FIRST, PQ_EF, PQ_EF_T, PQ_EF_INT, PQ_EF_DUR, PQ_EF_FIRST,
+       PQ_WS, PQ_WS_T, PQ_DZ, PQ_DZ_T, PQ_UB, PQ_UB_T, PQ_FF, PQ_FF_T, PQ_NIMP, PQ_W2, PQ_ZPREV, PQ_N };
 
 __device__ inline void pts_mx(double *q, int a, double v, double ts) { if (v > q[a]) { q[a] = v; q[a + 1] = ts; } }
 
 __global__ void k_pts_step(int np, const int *pk, const float *zl, const real *zs, const real *zb, const real *u,
-                           const real *v, double *Q, double ts, double dt, double g, double hmin) {
+                           const real *v, const real *ws, double *Q, double ts, double dt, double g, double hmin) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= np) return;
     int k = pk[p];
     double *q = Q + (size_t)p * PQ_N;
     double z = zs[k], h = fmax(z - (double)zb[k], 0.0);
+    double zg = (double)zb[k];
+    double zp = q[PQ_ZPREV]; q[PQ_ZPREV] = (h > 1e-3) ? z : zg;   // previous water level (ground when dry; NaN: first step)
     pts_mx(q, PQ_ZS, z, ts); pts_mx(q, PQ_H, h, ts);
     if (h >= hmin) {
         double U = sqrt((double)u[k] * u[k] + (double)v[k] * v[k]);
@@ -38,6 +52,20 @@ __global__ void k_pts_step(int np, const int *pk, const float *zl, const real *z
         pts_mx(q, PQ_HU2, h * U * U, ts); pts_mx(q, PQ_HU, h * U, ts);
     }
     if (h <= 1e-3) return;   // dry: zs is the bed there, not water
+    double zbm = zl[2 * p], zfl = zl[2 * p + 1];
+    if (!isnan(zbm)) {
+        if (!isnan(zp) && zg < zbm && zp < zbm && z >= zbm && dt > 0) {   // impact: the surface reaches the deck
+            double w = fmax((double)ws[k], 0.0), dz = (z - zp) / dt;
+            pts_mx(q, PQ_WS, w, ts); pts_mx(q, PQ_DZ, dz, ts);
+            q[PQ_NIMP] += 1; q[PQ_W2] += w * w;
+        }
+        double e = z - zbm;
+        if (e > 0 && h >= hmin) {
+            double U2 = (double)u[k] * u[k] + (double)v[k] * v[k];
+            double d = isnan(zfl) ? e : fmin(e, fmax(zfl - zbm, 0.0));
+            pts_mx(q, PQ_UB, sqrt(U2), ts); pts_mx(q, PQ_FF, U2 * d, ts);
+        }
+    }
     for (int s = 0; s < 2; s++) {
         double zr = zl[2 * p + s];
         if (isnan(zr)) continue;
@@ -96,6 +124,7 @@ struct Gauges {
             double *q = &Q[(size_t)p * PQ_N];
             for (int a : {PQ_ZS, PQ_ZM, PQ_EB, PQ_EF}) q[a] = -1e30;
             q[PQ_EB_FIRST] = q[PQ_EF_FIRST] = -1;
+            q[PQ_ZPREV] = NAN;
         }
         CK(cudaMalloc(&d_Q, Q.size() * sizeof(double))); CK(cudaMemcpy(d_Q, Q.data(), Q.size() * sizeof(double), cudaMemcpyHostToDevice));
         bool resumed = P.hotstart && load();
@@ -106,9 +135,9 @@ struct Gauges {
     }
 
     // after every time step (t: model time of this run, dt: the step just taken)
-    void step(double t, double dt, const real *zs, const real *zb, const real *u, const real *v) {
+    void step(double t, double dt, const real *zs, const real *zb, const real *u, const real *v, const real *ws) {
         if (!on) return;
-        k_pts_step<<<(np + 127) / 128, 128>>>(np, d_k, d_zl, zs, zb, u, v, d_Q, t0 + t, dt, g, hmin);
+        k_pts_step<<<(np + 127) / 128, 128>>>(np, d_k, d_zl, zs, zb, u, v, ws, d_Q, t0 + t, dt, g, hmin);
         while (t >= tnext - 1e-9) {
             k_pts_sample<<<(np + 127) / 128, 128>>>(np, d_k, zs, d_ring, d_Q, W, ns, t0 + tnext);
             ns++; tnext += tint;
@@ -124,7 +153,8 @@ struct Gauges {
         FILE *f = fopen("pts_peaks.txt", "w");
         fprintf(f, "%% storm time %.1f s. Peaks with their storm time (s); U, Fr, hU2, hU only where h >= %.3f m.\n", t0 + t, hmin);
         fprintf(f, "%% id i j z_beam z_floor | zs_max t zsmean_max t h_max t U_max t Fr_max t hU2_max t hU_max t"
-                   " | beam: exc_max t int_m_s dur_s first_s | floor: exc_max t int_m_s dur_s first_s\n");
+                   " | beam: exc_max t int_m_s dur_s first_s | floor: exc_max t int_m_s dur_s first_s"
+                   " | impact: ws_max t dzdt_max t U_beam t F_face t n w2_sum\n");
         auto v = [](double x) { return x < -1e29 ? NAN : x; };
         for (int p = 0; p < np; p++) {
             const double *q = &Q[(size_t)p * PQ_N];
@@ -132,6 +162,8 @@ struct Gauges {
             for (int a = PQ_ZS; a < PQ_EB; a += 2) fprintf(f, " %8.4f %8.1f", v(q[a]), q[a + 1]);
             for (int a : {PQ_EB, PQ_EF})
                 fprintf(f, " %8.4f %8.1f %10.3f %8.1f %8.1f", v(q[a]), q[a + 1], q[a + 2], q[a + 3], q[a + 4]);
+            for (int a = PQ_WS; a < PQ_NIMP; a += 2) fprintf(f, " %8.4f %8.1f", q[a], q[a + 1]);
+            fprintf(f, " %7.0f %10.4f", q[PQ_NIMP], q[PQ_W2]);
             fprintf(f, "\n");
         }
         fclose(f);
