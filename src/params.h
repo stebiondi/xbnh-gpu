@@ -197,7 +197,7 @@ struct Params {
     int vegnonlin = 0, vegcanflo = 0, veguntow = 1, porcanflow = 0;
     double Kp = 0.0001, Cm = 1.0;
     // GPU-specific keys
-    double gpu_solver_acc = 1e-3; int gpu_maxit = 200, gpu_hotstart_keepuv = 1;
+    double gpu_solver_acc = 1e-3; int gpu_warm = 0, gpu_dump_step = 0, gpu_solver = 0; double gpu_cheb_gmax = 0.995; int gpu_maxit = 200, gpu_hotstart_keepuv = 1;
     // derived
     double theta0 = 0;   // s%theta0 from dir0
 };
@@ -586,6 +586,10 @@ static void read_params(ParFile &F, Params &p) {
     // GPU keys
     p.gpu_solver_acc = F.dbl("gpu_solver_acc", 1e-3);
     p.gpu_maxit = F.integer("gpu_maxit", 200);
+    p.gpu_warm = F.integer("gpu_warm", 0);
+    p.gpu_solver = F.integer("gpu_solver", 0);
+    p.gpu_cheb_gmax = F.dbl("gpu_cheb_gmax", 0.995);
+    p.gpu_dump_step = F.integer("gpu_dump_step", 0);
     p.gpu_hotstart_keepuv = F.integer("gpu_hotstart_keepuv", 1);
 
     // post-processing (params.F90 after reading)
