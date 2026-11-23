@@ -26,8 +26,16 @@
 // cell-centre velocity), (3) the quasi-static water-level difference across the building rho g / 2 (hwbar_max^2 -
 // hwbar_min^2); with the times of the peaks. hw is the water height against the wall: water level at the perimeter
 // cell minus the building's ground elevation (mean bare earth under its cells), not the cell depth, so a canal or
-// a lower lot next to the building does not count as water on the wall; hwbar uses the 2 min mean water level. Wind is uniform in
-// the model (wind.txt) and is evaluated from it after the run.
+// a lower lot next to the building does not count as water on the wall; hwbar uses the 2 min mean water level.
+// Total lateral load (bldg_impulse.txt, last columns): the same three water terms and the wind, all at one instant (the
+// centre of the 2 min window, where F is evaluated), per unit wall width:
+//   F_total(t) = max over the perimeter of [F + rho hw |U|^2]  +  rho g / 2 (hwbar_max^2 - hwbar_min^2)
+//              + 1/2 rho_air C_f V(t)^2 max(H - hwbar_mean, 0)
+// V: wind speed from windfile (uniform), C_f: bldg_wind_cf (1.3 = 0.8 windward + 0.5 leeward wall pressure), rho_air:
+// bldg_rhoa (1.25), H: building height from bldg_heightfile (lines "id height_m", id as in bldg_impulse.txt; buildings
+// not listed, or no file: no wind term). The peak of F_total over the storm is recorded with its time and its three
+// parts at that time (wave + drag, quasi-static, wind): the parts peak at different times, so their separate peaks
+// do not add up to the peak of the total.
 //
 // Buildings: 4-connected cells with the same threshold value (> 0). Standing: any cell raised more than 1 m
 // above bare earth in the current bed. Perimeter of b: the 4-neighbours of its cells that are not cells of b
@@ -37,10 +45,11 @@
 #pragma once
 #include <fstream>
 #include <deque>
+#include <sstream>
 #include <algorithm>
 
 __global__ void k_bldg_sample(int npc, const int *pc, const real *zs, const real *zb, const real *u, const real *v,
-                              float *ring, double *J, float *hb, float *Fc, float *m2,
+                              float *ring, double *J, float *hb, float *Fc, float *m2, float *ringU, float *hcc, float *m2c,
                               int W, long ns, double rhog2, double tint, int fpos) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= npc) return;
@@ -48,7 +57,8 @@ __global__ void k_bldg_sample(int npc, const int *pc, const real *zs, const real
     float hnow = fmaxf((float)(zs[k] - zb[k]), 0.f);
     ring[(size_t)(ns % W) * npc + p] = hnow;
     m2[p] = hnow > 0.f ? (float)(u[k] * u[k] + v[k] * v[k]) : 0.f;
-    if (ns < W - 1) { hb[p] = 0.f; Fc[p] = 0.f; return; }   // window not full yet
+    ringU[(size_t)(ns % W) * npc + p] = m2[p];
+    if (ns < W - 1) { hb[p] = 0.f; Fc[p] = 0.f; hcc[p] = 0.f; m2c[p] = 0.f; return; }   // window not full yet
     double s = 0;
     for (int q = 0; q < W; q++) s += ring[(size_t)q * npc + p];
     double hbar = s / W;
@@ -56,33 +66,47 @@ __global__ void k_bldg_sample(int npc, const int *pc, const real *zs, const real
     double F = rhog2 * (hc * hc - hbar * hbar);
     J[p] += (fpos ? fmax(F, 0.0) : F) * tint;
     hb[p] = (float)hbar; Fc[p] = (float)F;
+    hcc[p] = (float)hc; m2c[p] = ringU[(size_t)((ns - (W - 1) / 2) % W) * npc + p];   // depth and |U|^2 at the centre
 }
 
 // per standing building: peaks over its perimeter of F, h|U|^2 and hbar_max^2 - hbar_min^2 (pk[3b..3b+2], times pt)
 __global__ void k_bldg_peaks(int nb, const int *ofs, const int *idx, const char *stand, const float *hb, const float *Fc,
                              const float *m2, const int *pc, const real *zs, const real *zb, const float *zg,
-                             double *pk, double *pt, double tF, double tM, int full) {
+                             double *pk, double *pt, double tF, double tM, int full,
+                             const float *hcc, const float *m2c, const float *Hb, double rho, double rhog2, double qwind,
+                             double *pk2, double *pt2) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nb || !stand[b]) return;
     float fmx = 0.f, mmx = 0.f, hmx = 0.f, hmn = 1e30f, g0 = zg[b];
+    double fwd = -1e300;                                                            // max of wave + drag at the centre
     for (int q = ofs[b]; q < ofs[b + 1]; q++) {
         int p = idx[q], k = pc[p];
         float hw = fmaxf((float)zs[k] - g0, 0.f);                                   // water on the wall now
         float hwb = hb[p] > 0.f ? fmaxf(hb[p] + (float)zb[k] - g0, 0.f) : 0.f;      // from the 2 min mean level
         fmx = fmaxf(fmx, Fc[p]); mmx = fmaxf(mmx, hw * m2[p]);
         hmx = fmaxf(hmx, hwb); hmn = fminf(hmn, hwb);
+        float hwc = hcc[p] > 0.f ? fmaxf(hcc[p] + (float)zb[k] - g0, 0.f) : 0.f;   // on the wall at the centre
+        fwd = fmax(fwd, (double)Fc[p] + rho * hwc * m2c[p]);
     }
     if (mmx > pk[3 * b + 1]) { pk[3 * b + 1] = mmx; pt[3 * b + 1] = tM; }
     if (!full) return;
     if (fmx > pk[3 * b]) { pk[3 * b] = fmx; pt[3 * b] = tF; }
     float ds = hmx * hmx - hmn * hmn;
     if (ds > pk[3 * b + 2]) { pk[3 * b + 2] = ds; pt[3 * b + 2] = tF; }
+    if (ofs[b + 1] == ofs[b]) return;
+    double fh = rhog2 * ds, H = Hb ? (double)Hb[b] : 0.0;
+    double fw = qwind * fmax(H - 0.5 * ((double)hmx + hmn), 0.0);
+    double tot = fwd + fh + fw;
+    if (tot > pk2[4 * b]) { pk2[4 * b] = tot; pk2[4 * b + 1] = fwd; pk2[4 * b + 2] = fh; pk2[4 * b + 3] = fw; pt2[b] = tF; }
 }
 
 struct Buildings {
     bool on = false;
     int W = 241, fpos = 1;
-    double tint = 0.5, tavg = 120, rho = 1025, g = 9.81, tnext = 0;
+    double tint = 0.5, tavg = 120, rho = 1025, g = 9.81, tnext = 0, wind_cf = 1.3, rhoa = 1.25;
+    std::vector<double> wind_t, wind_s;             // wind speed series (set by the caller when wind is on)
+    float *d_ringU = nullptr, *d_hcc = nullptr, *d_m2c = nullptr, *d_H = nullptr; double *d_pk2 = nullptr, *d_pt2 = nullptr;
+    int nH = 0;
     long ns = 0;                                    // samples taken since the cold start
     int nb = 0, npc = 0;
     std::vector<double> thr;                        // N s / m
@@ -110,6 +134,8 @@ struct Buildings {
         tint = F.dbl("bldg_tint", 0.5); tavg = F.dbl("bldg_tavg", 120.0); rho = F.dbl("bldg_rho", 1025.0);
         fpos = F.integer("bldg_fpos", 1); statefile = F.name("bldg_state", "bldg_state.bin"); g = P.g;
         dump = F.integer("bldg_dump", 0); NX1_ = NX1; tcheck = F.dbl("bldg_tcheck", 0.0);
+        wind_cf = F.dbl("bldg_wind_cf", 1.3); rhoa = F.dbl("bldg_rhoa", 1.25);
+        std::string hf = F.name("bldg_heightfile");
         W = (int)lround(tavg / tint) + 1; if (W % 2 == 0) W++;
         const size_t N = (size_t)NX1 * NY1;
         std::vector<double> th; read_grid_file(tf, NX1, NY1, th, true);
@@ -167,6 +193,24 @@ struct Buildings {
             for (int b = 0; b < nb; b++) { for (int p : per[b]) idx.push_back(p); ofs[b + 1] = (int)idx.size(); }
             CK(cudaMalloc(&d_ofs, (nb + 1) * sizeof(int))); CK(cudaMemcpy(d_ofs, ofs.data(), (nb + 1) * sizeof(int), cudaMemcpyHostToDevice));
             CK(cudaMalloc(&d_idx, std::max<size_t>(1, idx.size()) * sizeof(int))); CK(cudaMemcpy(d_idx, idx.data(), idx.size() * sizeof(int), cudaMemcpyHostToDevice)); }
+        CK(cudaMalloc(&d_ringU, (size_t)W * npc * sizeof(float))); CK(cudaMemset(d_ringU, 0, (size_t)W * npc * sizeof(float)));
+        for (float **a : {&d_hcc, &d_m2c}) { CK(cudaMalloc(a, npc * sizeof(float))); CK(cudaMemset(*a, 0, npc * sizeof(float))); }
+        CK(cudaMalloc(&d_pk2, 4 * nb * sizeof(double))); CK(cudaMalloc(&d_pt2, nb * sizeof(double)));
+        {   std::vector<double> z4(4 * nb, -1e300); CK(cudaMemcpy(d_pk2, z4.data(), 4 * nb * sizeof(double), cudaMemcpyHostToDevice)); }
+        CK(cudaMemset(d_pt2, 0, nb * sizeof(double)));
+        if (!hf.empty()) {   // building heights for the wind term
+            std::ifstream f(hf);
+            if (!f) fail("bldg_heightfile " + hf + " not found");
+            std::vector<float> H(nb, 0.f); std::string ln;
+            while (std::getline(f, ln)) {
+                size_t c = ln.find('%'); if (c != std::string::npos) ln.erase(c);
+                std::istringstream s(ln); int id; double h;
+                if (!(s >> id >> h)) continue;
+                if (id < 1 || id > nb) fail("bldg_heightfile: building " + std::to_string(id) + " not in bldgfile");
+                H[id - 1] = (float)h; nH++;
+            }
+            CK(cudaMalloc(&d_H, nb * sizeof(float))); CK(cudaMemcpy(d_H, H.data(), nb * sizeof(float), cudaMemcpyHostToDevice));
+        }
         CK(cudaMalloc(&d_st, nb)); CK(cudaMalloc(&d_pk, 3 * nb * sizeof(double))); CK(cudaMalloc(&d_pt, 3 * nb * sizeof(double)));
         CK(cudaMemset(d_pk, 0, 3 * nb * sizeof(double))); CK(cudaMemset(d_pt, 0, 3 * nb * sizeof(double)));
         {   std::vector<float> zg(nb, 0.f);   // building ground elevation: mean bare earth under its cells
@@ -176,8 +220,8 @@ struct Buildings {
         if (P.hotstart) resumed = load();
         CK(cudaMemcpy(d_st, standing.data(), nb, cudaMemcpyHostToDevice));
         int ns0 = 0; for (char s : standing) ns0 += s;
-        printf("buildings: %d (%d standing), %d perimeter cells, window %d samples x %.2f s, state %s\n",
-               nb, ns0, npc, W, tint, resumed ? ("resumed from " + statefile + ", sample " + std::to_string(ns)).c_str() : "new");
+        printf("buildings: %d (%d standing), %d perimeter cells, window %d samples x %.2f s, state %s; heights for the wind term %d\n",
+               nb, ns0, npc, W, tint, resumed ? ("resumed from " + statefile + ", sample " + std::to_string(ns)).c_str() : "new", nH);
         fflush(stdout);
         tnext = tint; tnextcheck = tcheck;
     }
@@ -186,10 +230,14 @@ struct Buildings {
     void step(double t, const real *zs, const real *zb, const real *u, const real *v) {
         if (!on) return;
         while (t >= tnext - 1e-9) {
-            k_bldg_sample<<<(npc + 255) / 256, 256>>>(npc, d_pc, zs, zb, u, v, d_ring, d_J, d_hb, d_Fc, d_m2, W, ns, 0.5 * rho * g, tint, fpos);
+            k_bldg_sample<<<(npc + 255) / 256, 256>>>(npc, d_pc, zs, zb, u, v, d_ring, d_J, d_hb, d_Fc, d_m2, d_ringU, d_hcc, d_m2c,
+                                                      W, ns, 0.5 * rho * g, tint, fpos);
             double ts = (ns + 1) * tint;   // storm time of this sample (s since the cold start; ns carries over)
+            double tc = tnext - (W - 1) / 2 * tint, V = 0;   // model time of the window centre: wind at that time
+            if (!wind_t.empty()) V = wind_t.size() > 1 ? lin_interp(wind_t, wind_s, tc) : wind_s[0];
             k_bldg_peaks<<<(nb + 127) / 128, 128>>>(nb, d_ofs, d_idx, d_st, d_hb, d_Fc, d_m2, d_pc, zs, zb, d_zg, d_pk, d_pt,
-                                                    ts - (W - 1) / 2 * tint, ts, ns >= W - 1 ? 1 : 0);
+                                                    ts - (W - 1) / 2 * tint, ts, ns >= W - 1 ? 1 : 0, d_hcc, d_m2c, d_H, rho,
+                                                    0.5 * rho * g, 0.5 * rhoa * wind_cf * V * V, d_pk2, d_pt2);
             ns++; tnext += tint;
         }
     }
@@ -249,12 +297,18 @@ struct Buildings {
         CK(cudaMemcpy(pk.data(), d_pk, 3 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(pt.data(), d_pt, 3 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         fprintf(f, "%% id i j threshold_kNhr_m impulse_kNhr_m standing ncells | peaks while standing, kN/m, and storm time s:"
-                   " wave_F t drag_Cd2 t dhydrostatic t\n");
-        for (int b = 0; b < nb; b++)
-            fprintf(f, "%6d %5d %5d %6.1f %12.5f %d %6zu %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f\n", b + 1, ic[b], jc[b], thr[b] / 3.6e6,
-                    Jcum[b] / 3.6e6, standing[b], cells[b].size(),
+                   " wave_F t drag_Cd2 t dhydrostatic t | total lateral load at one instant, kN/m: F_total t wave+drag quasistatic wind\n");
+        std::vector<double> pk2(4 * nb), pt2(nb);
+        CK(cudaMemcpy(pk2.data(), d_pk2, 4 * nb * sizeof(double), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(pt2.data(), d_pt2, nb * sizeof(double), cudaMemcpyDeviceToHost));
+        for (int b = 0; b < nb; b++) {
+            const double *q = &pk2[4 * b]; bool ok = q[0] > -1e299;   // never evaluated: 0
+            fprintf(f, "%6d %5d %5d %6.1f %12.5f %d %6zu %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f %9.3f %9.3f %9.3f\n",
+                    b + 1, ic[b], jc[b], thr[b] / 3.6e6, Jcum[b] / 3.6e6, standing[b], cells[b].size(),
                     pk[3 * b] / 1e3, pt[3 * b], rho * pk[3 * b + 1] / 1e3, pt[3 * b + 1],
-                    0.5 * rho * g * pk[3 * b + 2] / 1e3, pt[3 * b + 2]);
+                    0.5 * rho * g * pk[3 * b + 2] / 1e3, pt[3 * b + 2],
+                    ok ? q[0] / 1e3 : 0.0, pt2[b], ok ? q[1] / 1e3 : 0.0, ok ? q[2] / 1e3 : 0.0, ok ? q[3] / 1e3 : 0.0);
+        }
         fclose(f);
     }
 
@@ -272,6 +326,12 @@ struct Buildings {
         CK(cudaMemcpy(pk.data(), d_pk, 3 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(pt.data(), d_pt, 3 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         o.write((char *)pk.data(), 3 * nb * sizeof(double)); o.write((char *)pt.data(), 3 * nb * sizeof(double));
+        {   std::vector<double> pk2(4 * nb), pt2(nb); std::vector<float> rU((size_t)W * npc);
+            CK(cudaMemcpy(pk2.data(), d_pk2, 4 * nb * sizeof(double), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(pt2.data(), d_pt2, nb * sizeof(double), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(rU.data(), d_ringU, rU.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            o.write((char *)pk2.data(), 4 * nb * sizeof(double)); o.write((char *)pt2.data(), nb * sizeof(double));
+            o.write((char *)rU.data(), rU.size() * sizeof(float)); }
         o.close();
         std::rename(tmp.c_str(), statefile.c_str());
     }
@@ -288,6 +348,15 @@ struct Buildings {
         std::vector<double> pk(3 * nb), pt(3 * nb);
         f.read((char *)pk.data(), 3 * nb * sizeof(double)); f.read((char *)pt.data(), 3 * nb * sizeof(double));
         if (!f) fail(statefile + ": truncated");
+        {   std::vector<double> pk2(4 * nb), pt2(nb); std::vector<float> rU((size_t)W * npc);
+            f.read((char *)pk2.data(), 4 * nb * sizeof(double)); f.read((char *)pt2.data(), nb * sizeof(double));
+            f.read((char *)rU.data(), rU.size() * sizeof(float));
+            if (f) {
+                CK(cudaMemcpy(d_pk2, pk2.data(), 4 * nb * sizeof(double), cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(d_pt2, pt2.data(), nb * sizeof(double), cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(d_ringU, rU.data(), rU.size() * sizeof(float), cudaMemcpyHostToDevice));
+            } else printf("buildings: %s has no total-load state (older run): total load starts here\n", statefile.c_str());
+        }
         CK(cudaMemcpy(d_pk, pk.data(), 3 * nb * sizeof(double), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_pt, pt.data(), 3 * nb * sizeof(double), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_J, J.data(), npc * sizeof(double), cudaMemcpyHostToDevice));

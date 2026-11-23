@@ -445,6 +445,10 @@ int main(int argc, char **argv) {
     H2D(hd.zb, toreal(zb));
     Buildings BL;   // sequential building failure (bldgfile), k_bldg.cuh
     BL.init(F, P, NX1, NY1, I, zb);
+    if (BL.on && P.wind) {   // wind speed series for the wind term of the building total load
+        BL.wind_t = wind_t;
+        for (size_t q = 0; q < wind_x.size(); q++) BL.wind_s.push_back(std::hypot(wind_x[q], wind_y[q]));
+    }
     Gauges GP;      // elevated-building point gauges (ptsfile), k_pts.cuh
     GP.init(F, P, NX1, NY1, I);
     // tide_init: zsinitfile, or the corner levels at t = 0 spread over the grid (fill_tide_grid)
