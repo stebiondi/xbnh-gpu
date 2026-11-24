@@ -9,16 +9,22 @@
 // boundaryconditions.F90 velocity_Boundary: scalar or vector file, linear in time between records
 struct NHBC {
     Tok *tk = nullptr; bool vec = false, eof = false;
+    FILE *bf = nullptr; std::vector<float> fbuf;   // binary series (NHBCBIN1)
     int nvar = 0, NY1 = 0;
     int iU = -1, iV = -1, iZ = -1, iW = -1, idU = -1, idV = -1, iQ = -1;   // column index - 1 (first is t)
     double t0 = 0, t1 = 0, bcst = 0; std::vector<double> a0, a1;
     std::string fname;
     bool just_opened = false;   // velocity_Boundary: the call that opens a file interpolates (or extrapolates)
                                 // between its first two records without advancing
-    ~NHBC() { delete tk; }
-    void open(const std::string &fn, int ny1, double bcstarttime) {
-        delete tk; tk = nullptr;
-        NY1 = ny1; fname = fn; bcst = bcstarttime; eof = false;
+    ~NHBC() { delete tk; if (bf) fclose(bf); }
+    void open(const std::string &fn, int ny1, double bcstarttime, bool offset_ascii = true) {
+        delete tk; tk = nullptr; if (bf) { fclose(bf); bf = nullptr; }
+        NY1 = ny1; fname = fn; bcst = offset_ascii ? bcstarttime : 0; eof = false;
+        {   char mg[8] = {0}; FILE *f = fopen(fn.c_str(), "rb");
+            if (!f) fail("cannot open " + fn);
+            size_t got = fread(mg, 1, 8, f);
+            if (got == 8 && std::string(mg, 8) == "NHBCBIN1") { bf = f; open_bin(fn, ny1, bcstarttime); return; }
+            fclose(f); }
         tk = new Tok(fn);
         std::string w; tk->word(w);
         std::string lw = lower(w);
@@ -28,6 +34,12 @@ struct NHBC {
         // XBeach keeps the header indices of earlier files (SAVE variables never reset)
         for (int q = 0; q < nvar; q++) {
             tk->word(w);
+            set_col(fn, w, q);
+        }
+        first_rows(fn);
+    }
+    void set_col(const std::string &fn, const std::string &w, int q) {
+        {
             int col = q - 1;
             if (w == "z" || w == "Z" || w == "zs" || w == "ZS" || w == "Zs") iZ = col;
             else if (w == "t" || w == "T") { if (q != 0) fail(fn + ": t must be the first column"); }
@@ -39,6 +51,23 @@ struct NHBC {
             else if (w == "q" || w == "Q") { iQ = col; iU = col; }
             else if (w == "dq" || w == "dQ") idU = col;
         }
+    }
+    void open_bin(const std::string &fn, int ny1, double bcstarttime) {
+        int32_t h[2];
+        if (fread(h, 4, 2, bf) != 2) fail(fn + ": truncated header");
+        nvar = h[0]; vec = true;
+        if (h[1] != ny1) fail(fn + ": binary series has " + std::to_string(h[1]) + " boundary points, the grid " + std::to_string(ny1));
+        for (int q = 0; q < nvar; q++) {
+            char nm[9] = {0};
+            if (fread(nm, 1, 8, bf) != 8) fail(fn + ": truncated header");
+            std::string w(nm); w.erase(w.find_last_not_of(' ') + 1);
+            set_col(fn, w, q);
+        }
+        fbuf.resize((size_t)(nvar - 1) * NY1);
+        bcst = bcstarttime;   // binary series: times relative to the list line start
+        first_rows(fn);
+    }
+    void first_rows(const std::string &fn) {
         a0.assign((size_t)(nvar - 1) * NY1, 0); a1 = a0;
         if (!read_row(t0, a0)) fail(fn + ": boundary file has no data");
         t0 += bcst;
@@ -46,6 +75,12 @@ struct NHBC {
         just_opened = true;
     }
     bool read_row(double &t, std::vector<double> &a) {
+        if (bf) {
+            if (fread(&t, 8, 1, bf) != 1) return false;
+            if (fread(fbuf.data(), 4, fbuf.size(), bf) != fbuf.size()) return false;
+            for (size_t k = 0; k < fbuf.size(); k++) a[k] = fbuf[k];
+            return true;
+        }
         if (!tk->num(t)) return false;
         for (int q = 0; q < nvar - 1; q++) {
             if (vec) { for (int j = 0; j < NY1; j++) if (!tk->num(a[(size_t)q * NY1 + j])) return false; }
@@ -172,7 +207,7 @@ struct WaveBC {
         }
         if (startbcf) {
             read_list_line(curline);
-            bc.open(nhfile, NY1, nhfile == "nh_reuse.bcf" ? bcstarttime : 0);
+            bc.open(nhfile, NY1, bcstarttime, nhfile == "nh_reuse.bcf");   // binary series: always offset
             o.newwcoef = 1;
         }
         bc.advance(t);

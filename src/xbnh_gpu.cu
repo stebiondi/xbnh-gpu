@@ -45,6 +45,8 @@
 #include "k_morph.cuh"
 #include "k_gravel.cuh"
 #include "output.h"
+#include "k_bldg.cuh"
+#include "k_pts.cuh"
 
 static const char *XBNH_VERSION = "2.0.0";
 
@@ -441,6 +443,14 @@ int main(int argc, char **argv) {
 
     // flow_init
     H2D(hd.zb, toreal(zb));
+    Buildings BL;   // sequential building failure (bldgfile), k_bldg.cuh
+    BL.init(F, P, NX1, NY1, I, zb);
+    if (BL.on && P.wind) {   // wind speed series for the wind term of the building total load
+        BL.wind_t = wind_t;
+        for (size_t q = 0; q < wind_x.size(); q++) BL.wind_s.push_back(std::hypot(wind_x[q], wind_y[q]));
+    }
+    Gauges GP;      // elevated-building point gauges (ptsfile), k_pts.cuh
+    GP.init(F, P, NX1, NY1, I);
     // tide_init: zsinitfile, or the corner levels at t = 0 spread over the grid (fill_tide_grid)
     if (!P.zsinitfile.empty()) {
         std::vector<double> z0; read_grid_file(P.zsinitfile, NX1, NY1, z0, true); H2D(hd.zs0, toreal(z0));
@@ -595,7 +605,17 @@ int main(int argc, char **argv) {
 
     // hotstart writing (writehotstart): the variables hotstart = 1 reads back
     int hs_count = 0;
+    auto bldg_check = [&](double tt) {
+        BL.check(tt, hd.zs, hd.zb, N, P.eps, [&](real *a, size_t n) { return D2H(a, n); },
+                 [&](real *a, const std::vector<real> &v) { H2D(a, v); });
+    };
+    auto bldg_quick = [&](double tt) {
+        BL.check(tt, hd.zs, hd.zb, N, P.eps, [&](real *a, size_t n) { return D2H(a, n); },
+                 [&](real *a, const std::vector<real> &v) { H2D(a, v); }, true);
+    };
     auto write_hotstart_all = [&](double tt) {
+        if (BL.on) bldg_check(tt);   // removals go into this hotstart
+        GP.write(tt);
         hs_count++;
         auto wr = [&](const char *nm, real *src) { std::vector<real> a = D2H(src, N); write_hotstart(nm, hs_count, NX1, NY1, a.data(), false); };
         wr("zs", hd.zs); wr("zb", hd.zb); wr("uu", hd.uu); wr("vv", hd.vv); wr("wb", hd.wb); wr("ws", hd.ws);
@@ -629,13 +649,25 @@ int main(int argc, char **argv) {
     };
     bool first_flow = true, aborted = false;
     // 2D BiCGStab on mat/rhs (inner cells); returns the iteration count, dp = 0 when the right-hand side is zero
-    auto bicgstab = [&](int &it) {
+    // warm start of the NH pressure solve: previous solutions (dpw[0] = x_{n-1}, dpw[1] = x_{n-2})
+    real *dpw[2] = {nullptr, nullptr}; long nwarm = 0;
+    if (P.gpu_warm > 0) { CK(cudaMalloc(&dpw[0], N * sizeof(real))); CK(cudaMalloc(&dpw[1], N * sizeof(real))); }
+    // guess: 0 = zero start, 1 = warm start from dpw, 2 = start from the dp already in place
+    auto bicgstab_g = [&](int &it, int guess) {
         it = 0;
         CK(cudaMemset(hd.sc, 0, 16 * sizeof(double)));
-        k_s_init<<<GG, B>>>();
+        bool warm = guess == 2 || (guess == 1 && P.gpu_warm > 0 && nwarm > 0);
+        if (warm) {
+            if (guess == 1) k_s_guess<<<GG, B>>>(dpw[0], dpw[1], (P.gpu_warm == 2 && nwarm > 1) ? 2 : 1, hd.nonhZ);
+            k_s_init_warm<<<GG, B>>>();
+        } else k_s_init<<<GG, B>>>();
         double sch[16]; CK(cudaMemcpy(sch, hd.sc, sizeof(sch), cudaMemcpyDeviceToHost));
         if (!(sch[8] > 0)) { CK(cudaMemset(hd.dp, 0, N * sizeof(real))); return; }
         double tgt = P.gpu_solver_acc * P.gpu_solver_acc * sch[8];
+        if (warm) {
+            if (sch[7] < tgt) return;   // the guess already meets the tolerance
+            CK(cudaMemcpy(hd.sc + 9, &sch[7], 8, cudaMemcpyHostToDevice));
+        }
         CK(cudaMemcpy(hd.sc + 13, &tgt, 8, cudaMemcpyHostToDevice));
         const int batch = 4;
         for (it = 1; it <= P.gpu_maxit; it++) {
@@ -649,6 +681,96 @@ int main(int argc, char **argv) {
         }
         nonconv++; it = P.gpu_maxit;
     };
+    auto bicgstab = [&](int &it, bool warm) { bicgstab_g(it, warm ? 1 : 0); };
+    auto bicgstab_from_dp = [&](int &it) { bicgstab_g(it, 2); };
+    // Chebyshev solve of the NH pressure system (gpu_solver = 1), BiCGStab from the last iterate when it fails
+    real *chx[3] = {nullptr, nullptr, nullptr}; double *chrr = nullptr; unsigned *chg = nullptr;
+    long ch_fallback = 0, ch_gskip = 0; double ch_gsum = 0; long ch_n = 0;
+    const int ch_max = 255;
+    if (P.gpu_solver == 1) {
+        for (auto &b : chx) { CK(cudaMalloc(&b, N * sizeof(real))); CK(cudaMemset(b, 0, N * sizeof(real))); }
+        CK(cudaMalloc(&chrr, (ch_max + 1) * sizeof(double))); CK(cudaMalloc(&chg, sizeof(unsigned)));
+    }
+    auto chebyshev = [&](int &it) {
+        it = 0;
+        CK(cudaMemsetAsync(chg, 0, sizeof(unsigned)));
+        CK(cudaMemsetAsync(hd.sc, 0, 16 * sizeof(double)));
+        CK(cudaMemsetAsync(chrr, 0, (ch_max + 1) * sizeof(double)));
+        k_ch_gersh<<<GG, B>>>(chg);
+        bool warm = P.gpu_warm > 0 && nwarm > 0;
+        if (warm) k_s_guess<<<GG, B>>>(dpw[0], dpw[1], (P.gpu_warm == 2 && nwarm > 1) ? 2 : 1, hd.nonhZ);
+        else CK(cudaMemsetAsync(hd.dp, 0, N * sizeof(real)));
+        k_ch_bb<<<GG, B>>>(hd.dp);
+        unsigned gb; double sc8;
+        CK(cudaMemcpy(&gb, chg, 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&sc8, hd.sc + 8, 8, cudaMemcpyDeviceToHost));
+        float g; memcpy(&g, &gb, 4);
+        if (!(sc8 > 0)) { CK(cudaMemset(hd.dp, 0, N * sizeof(real))); return; }
+        double tgt = P.gpu_solver_acc * P.gpu_solver_acc * sc8;
+        int nconv = -1;
+        if (g < P.gpu_cheb_gmax) {
+            ch_gsum += g; ch_n++;
+            double lmin = 1.0 - g, lmax = 1.0 + g, th = 0.5 * (lmax + lmin), de = 0.5 * (lmax - lmin), sig = th / de;
+            CK(cudaMemcpyAsync(chx[0], hd.dp, N * sizeof(real), cudaMemcpyDeviceToDevice));
+            double rho = 1.0 / sig;
+            const int batch = 8;
+            std::vector<double> rrh(ch_max + 1);
+            for (int n = 0; n < ch_max; n++) {
+                double a = 0, cc = 1.0 / th;
+                if (n > 0) { double rn = 1.0 / (2 * sig - rho); a = rn * rho; cc = 2 * rn / de; rho = rn; }
+                k_ch_step<<<GG, B>>>(n, chx[n % 3], chx[(n + 2) % 3], chx[(n + 1) % 3], (real)a, (real)cc, chrr, tgt);
+                if ((n + 1) % batch == 0 || n == ch_max - 1) {
+                    CK(cudaMemcpy(rrh.data(), chrr, (n + 1) * sizeof(double), cudaMemcpyDeviceToHost));
+                    for (int m = 0; m <= n; m++) if (rrh[m] < tgt) { nconv = m; break; }
+                    if (nconv >= 0) break;
+                    if (!std::isfinite(rrh[n]) || (n >= 16 && rrh[n] > rrh[0])) break;   // diverging: complex spectrum
+                }
+            }
+        } else ch_gskip++;
+        if (nconv >= 0) {
+            it = nconv;
+            CK(cudaMemcpyAsync(hd.dp, chx[nconv % 3], N * sizeof(real), cudaMemcpyDeviceToDevice));
+            return;
+        }
+        ch_fallback++;
+        int itb = 0;
+        if (g < P.gpu_cheb_gmax) CK(cudaMemsetAsync(hd.dp, 0, N * sizeof(real)));   // diverged: start BiCGStab from zero
+        bicgstab_from_dp(itb);
+        it = ch_max + itb;
+    };
+    // fused BiCGStab (gpu_solver = 2): init as bicgstab (k_s_init / warm), then 3 kernels per iteration
+    double *fbS = nullptr;
+    if (P.gpu_solver == 2) CK(cudaMalloc(&fbS, 8 * (P.gpu_maxit + 2) * sizeof(double)));
+    auto bicgstab_fused = [&](int &it) {
+        it = 0;
+        CK(cudaMemsetAsync(hd.sc, 0, 16 * sizeof(double)));
+        CK(cudaMemsetAsync(fbS, 0, 8 * (P.gpu_maxit + 2) * sizeof(double)));
+        bool warm = P.gpu_warm > 0 && nwarm > 0;
+        if (warm) {
+            k_s_guess<<<GG, B>>>(dpw[0], dpw[1], (P.gpu_warm == 2 && nwarm > 1) ? 2 : 1, hd.nonhZ);
+            k_s_init_warm<<<GG, B>>>();
+        } else k_s_init<<<GG, B>>>();
+        double sch[16]; CK(cudaMemcpy(sch, hd.sc, sizeof(sch), cudaMemcpyDeviceToHost));
+        if (!(sch[8] > 0)) { CK(cudaMemset(hd.dp, 0, N * sizeof(real))); return; }
+        double tgt = P.gpu_solver_acc * P.gpu_solver_acc * sch[8];
+        double r0 = warm ? sch[7] : sch[8];
+        if (warm && r0 < tgt) return;
+        double s0[8] = {0, 0, 0, r0, r0, 0, 0, 0};   // slot 0: (r0,r0), (rhat,r0) = (r0,r0)
+        CK(cudaMemcpy(fbS, s0, sizeof(s0), cudaMemcpyHostToDevice));
+        FB f{hd.dp, hd.r, hd.rh, hd.t, nullptr, nullptr, nullptr, nullptr, fbS, tgt};
+        real *pb[2] = {hd.p, hd.y}, *vb[2] = {hd.v_, hd.z};
+        const int batch = 4;
+        std::vector<double> Sh(8 * (P.gpu_maxit + 2));
+        for (int n = 1; n <= P.gpu_maxit; n++) {
+            f.pi = pb[(n + 1) % 2]; f.po = pb[n % 2]; f.vi = vb[(n + 1) % 2]; f.vo = vb[n % 2];
+            k_fb1<<<GG, B>>>(f, n); k_fb2<<<GG, B>>>(f, n); k_fb3<<<GG, B>>>(f, n);
+            if (n % batch == 0 || n == P.gpu_maxit) {
+                CK(cudaMemcpy(Sh.data(), fbS, 8 * (n + 1) * sizeof(double), cudaMemcpyDeviceToHost));
+                for (int m = 1; m <= n; m++) if (Sh[8 * m + 3] < tgt) { it = m; return; }
+            }
+        }
+        nonconv++; it = P.gpu_maxit;
+    };
+    unsigned *dtest; CK(cudaMalloc(&dtest, sizeof(unsigned)));
     bool gw_initial = true;
     CK(cudaDeviceSynchronize());
     auto loop0 = std::chrono::steady_clock::now();
@@ -672,7 +794,8 @@ int main(int argc, char **argv) {
         } else {
             unsigned long long big = (unsigned long long)__builtin_bit_cast(long long, 1e300);
             CK(cudaMemcpy(hd.dtmin, &big, 8, cudaMemcpyHostToDevice));
-            k_dt<<<GG, B>>>();
+            { unsigned fm = 0x7f7fffffu; CK(cudaMemcpyAsync(dtest, &fm, 4, cudaMemcpyHostToDevice)); }
+            k_dt_est<<<GG, B>>>(dtest); k_dt<<<GG, B>>>(dtest);
             unsigned long long bits; CK(cudaMemcpy(&bits, hd.dtmin, 8, cudaMemcpyDeviceToHost));
             dt = __builtin_bit_cast(double, (long long)bits) * P.CFL * 0.5;
             dt = std::min(dt, dtgw);
@@ -713,7 +836,8 @@ int main(int argc, char **argv) {
         }
         {   // nonh_init_wcoef depends only on zs0 and zb: skip the recomputation (exact) when neither can change
             static const bool varies = !P.zs0file.empty() || P.morphology || P.setbathy;
-            if (wo.newwcoef && !q3 && P.dispc <= 0 && varies) init_wcoef();
+            if (!q3 && P.dispc <= 0 && BL.changed) { init_wcoef(); BL.changed = false; }   // a building was removed
+            else if (wo.newwcoef && !q3 && P.dispc <= 0 && varies) init_wcoef();
         }
         // gw_bc
         if (P.gwflow) {
@@ -857,7 +981,7 @@ int main(int argc, char **argv) {
                 k_gw_tri_build<<<(nx + 255) / 256, 256>>>(1); k_gw_thomas<<<1, 1>>>(1); k_gw_tri_after<<<bi, 256>>>(1);
             } else {
                 int itg = 0;
-                if (P.gwheadmodel == 0) { k_gw_sip_build<<<GG, B>>>(); bicgstab(itg); k_gw_sip_after<<<GG, B>>>(1); }
+                if (P.gwheadmodel == 0) { k_gw_sip_build<<<GG, B>>>(); bicgstab(itg, false); k_gw_sip_after<<<GG, B>>>(1); }
                 k_gw_head2d<<<GG, B>>>();
             }
             k_gw_vel<<<GG, B>>>(); k_gw_ksmooth<<<GG, B>>>(); k_gw_q<<<GG, B>>>(); k_gw_w<<<GG, B>>>();
@@ -954,11 +1078,25 @@ int main(int argc, char **argv) {
         int it = 0;
         if (oned) {
             k_pcr<<<1, 1024>>>(NX1);
-        } else bicgstab(it);
+        } else if (P.gpu_solver == 1) chebyshev(it);
+        else if (P.gpu_solver == 2) bicgstab_fused(it);
+        else bicgstab(it, true);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
+        if (P.gpu_dump_step > 0 && (nsolve + 1 == P.gpu_dump_step || nsolve == P.gpu_dump_step) && !oned) {   // debug: the systems of two successive solves
+            FILE *fd = fopen(nsolve + 1 == P.gpu_dump_step ? "solver_dump.bin" : "solver_dump_next.bin", "wb");
+            int hdr[4] = {NX1, NY1, (int)sizeof(real), h.cyclic};
+            fwrite(hdr, sizeof(int), 4, fd);
+            for (real *a : {hd.mat[0], hd.mat[1], hd.mat[2], hd.mat[3], hd.mat[4], hd.rhs, hd.dp}) { auto v = D2H(a, N); fwrite(v.data(), sizeof(real), N, fd); }
+            std::vector<int> nz(N); CK(cudaMemcpy(nz.data(), hd.nonhZ, N * sizeof(int), cudaMemcpyDeviceToHost)); fwrite(nz.data(), sizeof(int), N, fd);
+            fclose(fd); printf("solver system of solve %ld written to solver_dump.bin (it %d)\n", nsolve + 1, it);
+        }
         float ms; cudaEventElapsedTime(&ms, e0, e1); tsolve += ms * 1e-3;
         itsum += it; itmax = std::max(itmax, (long)it); nsolve++;
         cyc({hd.dp});
+        if (P.gpu_warm > 0 && !oned) {   // keep x_{n-1}, x_{n-2} for the next warm start
+            std::swap(dpw[0], dpw[1]);
+            CK(cudaMemcpyAsync(dpw[0], hd.dp, N * sizeof(real), cudaMemcpyDeviceToDevice)); nwarm++;
+        }
         if (!q3) {
             k_correct1<<<GG, B>>>();
             cyc({hd.uu, hd.vv, hd.pres});
@@ -1065,6 +1203,9 @@ int main(int argc, char **argv) {
             else k_setbathy<<<GG, B>>>(z0d, z1d, t, sb_t[jj - 1], sb_t[jj], 1);
         }
         nstep++;
+        BL.step(t, hd.zs, hd.zb, hd.u, hd.v);
+        GP.step(t, dt, hd.zs, hd.zb, hd.u, hd.v, hd.ws);
+        if (BL.on && BL.tcheck > 0 && t >= BL.tnextcheck - 1e-9) { bldg_quick(t); while (BL.tnextcheck <= t + 1e-9) BL.tnextcheck += BL.tcheck; }
         // output (outputext)
         out.accumulate(t, dt);
         if (out.output) {
@@ -1083,6 +1224,8 @@ int main(int argc, char **argv) {
         }
     }
     CK(cudaDeviceSynchronize());
+    if (BL.on && BL.tlast < t) bldg_check(t);   // no hotstart at the end of the run: check anyway
+    if (GP.on && GP.tlast < t) GP.write(t);
     out.close();
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
     double loop = std::chrono::duration<double>(std::chrono::steady_clock::now() - loop0).count();
@@ -1091,6 +1234,9 @@ int main(int argc, char **argv) {
                   "solver_s %.3f\nsolver_it_mean %.2f\nsolver_it_max %ld\nsolver_nonconv %ld\nunit_speed_s %.4e\naborted %d\n",
             XBNH_VERSION, sizeof(real) == 8 ? "fp64" : "fp32", nx, ny, N, h.cyclic, P.nonhq3d, nstep, wall, loop, tsolve,
             (double)itsum / std::max(nsolve, 1L), itmax, nonconv, loop / ((double)std::max(nstep, 1L) * N), aborted ? 1 : 0);
+    if (P.gpu_solver == 1)
+        fprintf(flog, "solver chebyshev\ncheb_g_mean %.4f\ncheb_fallback %ld\ncheb_gskip %ld\n", ch_gsum / std::max(ch_n, 1L), ch_fallback, ch_gskip);
+    if (P.gpu_warm > 0) fprintf(flog, "warm %d\n", P.gpu_warm);
     fclose(flog);
     printf("done: %ld steps, wall %.2f s (time loop %.2f s, solver %.2f s), %.3e s per cell-step, solver it mean %.1f max %ld nonconv %ld\n",
            nstep, wall, loop, tsolve, loop / ((double)std::max(nstep, 1L) * N), (double)itsum / std::max(nsolve, 1L), itmax, nonconv);

@@ -23,49 +23,69 @@ __global__ void k_wetcells() {
 __device__ __forceinline__ void atomic_min_pos(unsigned long long *a, double v) {
     atomicMin(a, (unsigned long long)__double_as_longlong(v));
 }
-__global__ void k_dt() {
+// CFL time step (XBeach timestep). The fp64 candidate (XBeach precision) is slow on consumer GPUs (fp64 at 1/64
+// rate), so k_dt_est first finds the fp32 minimum and k_dt evaluates fp64 only where the fp32 value is within
+// 1e-4 of it (fp32 error ~1e-6): the result is the same fp64 minimum as evaluating every cell.
+template <typename T> __device__ __forceinline__ T dt_cell(int i, int j) {
+    T dt = sizeof(T) == 8 ? (T)1e300 : (T)3e38f;
+    const T tny = sizeof(T) == 8 ? (T)2.2250738585072014e-308 : (T)1e-37f, g = (T)c.g, nmin = (T)1e-6f;
+    if (!c.oned && i >= 2 && i <= c.nx && j >= 2 && j <= c.ny) {
+        size_t k = ID(i, j);
+        if (d.wetu[k] == 1) {
+            T mdx = dsu(i + 1, j), mdy = fmin((T)dnv(i, j), (T)dnv(i, j - 1)), cu = sqrt(g * (T)d.hu[k]);
+            dt = fmin(dt, mdx / fmax(tny, fmax(cu + fabs((T)d.uu[k]), fabs((T)d.ueu[k]))));
+            dt = fmin(dt, mdy / fmax(tny, cu + fabs((T)d.vu[k])));
+        }
+        if (d.wetv[k] == 1) {
+            T mdx = fmin((T)dsu(i, j), (T)dsu(i - 1, j)), mdy = dnv(i, j), cv = sqrt(g * (T)d.hv[k]);
+            dt = fmin(dt, mdx / fmax(tny, cv + fabs((T)d.uv[k])));
+            dt = fmin(dt, mdy / fmax(tny, fmax(cv + fabs((T)d.vv[k]), fabs((T)d.vev[k]))));
+        }
+        if (d.wetz[k] == 1) {
+            T mdx = fmin((T)dsu(i, j), (T)dsz(i, j)); mdx *= mdx;
+            T mdy = fmin((T)dnv(i, j), (T)dnz(i, j)); mdy *= mdy;
+            dt = fmin(dt, (T)0.5 * mdx * mdy / (mdx + mdy) / fmax((T)d.nuh[k], nmin));
+        }
+    } else if (c.oned && i >= 2 && i <= c.nx && j == 1) {
+        size_t k = ID(i, 1);
+        if (d.wetu[k] == 1) {
+            T mdx = dsu(i, 1);
+            dt = fmin(dt, mdx / fmax(tny, fmax(sqrt(g * (T)d.hu[k]) + fabs((T)d.uu[k]), fabs((T)d.ueu[k]))));
+            if (c.sed_ngd > 0) {   // u-points bed celerity
+                real sb = 0, ss = 0;
+                for (int g = 0; g < c.sed_ngd; g++) { sb += d.Subg[(size_t)g * c.NX1 * c.NY1 + k]; ss += d.Susg[(size_t)g * c.NX1 * c.NY1 + k]; }
+                T celeru = (T)0.1 * fabs((T)(sb + ss)) * (T)c.sed_morfac / ((T)1 - (T)c.por);
+                dt = fmin(dt, mdx / fmax(tny, celeru));
+            }
+        }
+        if (d.wetz[k] == 1) {
+            T mdx = fmin((T)dsu(i, 1), (T)dsu(i - 1, 1));
+            dt = fmin(dt, mdx / fmax(tny, sqrt(g * (T)d.hv[k]) + fabs((T)d.uv[k])));
+            mdx = fmin((T)dsu(i, 1), (T)dsz(i, 1)); mdx *= mdx;
+            T mdy = c.par_dy > 0 ? (T)c.par_dy : mdx;
+            dt = fmin(dt, (T)0.5 * mdx * mdy / (mdx + mdy) / fmax((T)d.nuh[k], nmin));
+        }
+    }
+    return dt;
+}
+__global__ void k_dt_est(unsigned *est) {
+    __shared__ float sm[256];
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    sm[tid] = (i <= c.NX1 && j <= c.NY1) ? dt_cell<float>(i, j) : 3e38f;
+    __syncthreads();
+    for (int s = blockDim.x * blockDim.y / 2; s > 0; s >>= 1) { if (tid < s) sm[tid] = fminf(sm[tid], sm[tid + s]); __syncthreads(); }
+    if (tid == 0) atomicMin(est, __float_as_uint(fmaxf(sm[0], 0.f)));
+}
+__global__ void k_dt(const unsigned *est) {
     __shared__ double sm[256];
     int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
     double dt = 1e300;
-    const double tny = 2.2250738585072014e-308, g = c.g, nmin = (double)1e-6f;
-    if (!c.oned && i >= 2 && i <= c.nx && j >= 2 && j <= c.ny) {
-        size_t k = ID(i, j);
-        if (d.wetu[k] == 1) {
-            double mdx = dsu(i + 1, j), mdy = fmin((double)dnv(i, j), (double)dnv(i, j - 1)), cu = sqrt(g * d.hu[k]);
-            dt = fmin(dt, mdx / fmax(tny, fmax(cu + fabs((double)d.uu[k]), fabs((double)d.ueu[k]))));
-            dt = fmin(dt, mdy / fmax(tny, cu + fabs((double)d.vu[k])));
-        }
-        if (d.wetv[k] == 1) {
-            double mdx = fmin((double)dsu(i, j), (double)dsu(i - 1, j)), mdy = dnv(i, j), cv = sqrt(g * d.hv[k]);
-            dt = fmin(dt, mdx / fmax(tny, cv + fabs((double)d.uv[k])));
-            dt = fmin(dt, mdy / fmax(tny, fmax(cv + fabs((double)d.vv[k]), fabs((double)d.vev[k]))));
-        }
-        if (d.wetz[k] == 1) {
-            double mdx = fmin((double)dsu(i, j), (double)dsz(i, j)); mdx *= mdx;
-            double mdy = fmin((double)dnv(i, j), (double)dnz(i, j)); mdy *= mdy;
-            dt = fmin(dt, 0.5 * mdx * mdy / (mdx + mdy) / fmax((double)d.nuh[k], nmin));
-        }
-    } else if (c.oned && i >= 2 && i <= c.nx && j == 1) {
-        size_t k = ID(i, 1);
-        if (d.wetu[k] == 1) {
-            double mdx = dsu(i, 1);
-            dt = fmin(dt, mdx / fmax(tny, fmax(sqrt(g * d.hu[k]) + fabs((double)d.uu[k]), fabs((double)d.ueu[k]))));
-            if (c.sed_ngd > 0) {   // u-points bed celerity
-                real sb = 0, ss = 0;
-                for (int g = 0; g < c.sed_ngd; g++) { sb += d.Subg[(size_t)g * c.NX1 * c.NY1 + k]; ss += d.Susg[(size_t)g * c.NX1 * c.NY1 + k]; }
-                double celeru = 0.1 * fabs((double)(sb + ss)) * c.sed_morfac / (1.0 - c.por);
-                dt = fmin(dt, mdx / fmax(tny, celeru));
-            }
-        }
-        if (d.wetz[k] == 1) {
-            double mdx = fmin((double)dsu(i, 1), (double)dsu(i - 1, 1));
-            dt = fmin(dt, mdx / fmax(tny, sqrt(g * d.hv[k]) + fabs((double)d.uv[k])));
-            mdx = fmin((double)dsu(i, 1), (double)dsz(i, 1)); mdx *= mdx;
-            double mdy = c.par_dy > 0 ? (double)c.par_dy : mdx;
-            dt = fmin(dt, 0.5 * mdx * mdy / (mdx + mdy) / fmax((double)d.nuh[k], nmin));
-        }
+    if (i <= c.NX1 && j <= c.NY1) {
+        float m = __uint_as_float(*est);
+        if (dt_cell<float>(i, j) <= m * 1.0001f) dt = dt_cell<double>(i, j);
     }
     sm[tid] = dt;
     __syncthreads();

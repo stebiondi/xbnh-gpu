@@ -4,7 +4,7 @@
 # libnetcdf); NETCDF=0 builds without it.
 NVCC    ?= nvcc
 ARCH    ?= native
-NVFLAGS ?= -O3 -std=c++20
+NVFLAGS ?= -O3 -std=c++20 -Xcompiler -fopenmp
 NETCDF  ?= $(shell command -v nc-config > /dev/null 2>&1 && echo 1 || echo 0)
 ifeq ($(NETCDF),1)
 NCFLAGS = -DXB_NETCDF $(shell nc-config --cflags) $(shell nc-config --libs) -Xlinker -rpath=$(shell nc-config --prefix)/lib

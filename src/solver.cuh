@@ -22,6 +22,20 @@ __device__ __forceinline__ void block_sum2(double a, double b, double *out_a, do
         if (lane == 0) { if (out_a) atomicAdd(out_a, a); if (out_b) atomicAdd(out_b, b); }
     }
 }
+// fp32 products and in-block sums (<= 256 terms, relative error ~1e-5), one fp64 atomic per block
+__device__ __forceinline__ void block_sum2f(float a, float b, double *out_a, double *out_b) {
+    for (int o = 16; o > 0; o >>= 1) { a += __shfl_down_sync(0xffffffff, a, o); b += __shfl_down_sync(0xffffffff, b, o); }
+    __shared__ float sa[32], sb[32];
+    int lane = (threadIdx.y * blockDim.x + threadIdx.x) & 31, wid = (threadIdx.y * blockDim.x + threadIdx.x) >> 5;
+    if (lane == 0) { sa[wid] = a; sb[wid] = b; }
+    __syncthreads();
+    int nw = (blockDim.x * blockDim.y + 31) / 32;
+    if (wid == 0) {
+        a = lane < nw ? sa[lane] : 0; b = lane < nw ? sb[lane] : 0;
+        for (int o = 16; o > 0; o >>= 1) { a += __shfl_down_sync(0xffffffff, a, o); b += __shfl_down_sync(0xffffffff, b, o); }
+        if (lane == 0) { if (out_a) atomicAdd(out_a, (double)a); if (out_b) atomicAdd(out_b, (double)b); }
+    }
+}
 #define INTERIOR (i >= 2 && i <= c.nx && j >= c.ps_j0 && j <= c.ps_j1)
 __device__ __forceinline__ real Ax(const real *x, int i, int j) {
     size_t k = ID(i, j);
@@ -40,6 +54,27 @@ __global__ void k_s_init() {   // x = 0, r = rhat = b, p = v = 0; (b,b), (rhat,r
         bb = (double)b * b;
     }
     block_sum2(bb, bb, &d.sc[8], &d.sc[9]);
+}
+// Warm start (gpu_warm 1: x0 = previous solution, 2: linear extrapolation 2 x_{n-1} - x_{n-2}); x0 = 0 outside
+// the system and at excluded (identity) rows. Then r = rhat = b - A x0; (b,b) -> sc[8], (r,r) -> sc[7] (copied to sc[9] = (rhat,r) by the host).
+__global__ void k_s_guess(const real *x1, const real *x2, int mode, const int *mask) {
+    IJ
+    size_t k = ID(i, j);
+    real g = 0;
+    if (INTERIOR && (!mask || mask[k] == 1)) g = mode == 2 ? 2 * x1[k] - x2[k] : x1[k];
+    d.dp[k] = g;
+}
+__global__ void k_s_init_warm() {
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    double bb = 0, rr = 0;
+    if (i <= c.NX1 && j <= c.NY1) {
+        size_t k = ID(i, j);
+        real b = 0, r = 0;
+        if (INTERIOR) { b = d.rhs[k]; r = b - Ax(d.dp, i, j); }
+        d.r[k] = r; d.rh[k] = r; d.p[k] = 0; d.v_[k] = 0; d.y[k] = 0; d.z[k] = 0;
+        bb = (double)b * b; rr = (double)r * r;
+    }
+    block_sum2(bb, rr, &d.sc[8], &d.sc[7]);
 }
 __global__ void k_s_beta(int first) {
     if (threadIdx.x) return;
@@ -113,6 +148,149 @@ __global__ void k_s_roll() {
     if (threadIdx.x || d.sc[11] != 0) return;
     d.sc[1] = d.sc[0]; d.sc[12] += 1;
     if (d.sc[7] < d.sc[13]) d.sc[11] = 1;
+}
+
+// ---- Chebyshev iteration (gpu_solver = 1) on the Jacobi-scaled system D^-1 A x = D^-1 b. The eigenvalues of D^-1 A
+// lie in the Gershgorin discs |lambda - 1| <= g_k = sum|offdiag_k| / |diag_k|; for this system they are real in practice
+// (near-symmetric operator), so [1 - g, 1 + g] with g = max g_k bounds them. One fused kernel per iteration (one SpMV,
+// no inner products): x_{n+1} = x_n + a_n (x_n - x_{n-1}) + c_n D^-1 (b - A x_n), with |b - A x_n|^2 accumulated into
+// rr[n] for the same stopping test as BiCGStab. Launch n returns at once when some earlier rr[m] met the target, so
+// x_m stays intact in buffer m % 3. Not converged (complex eigenvalues, g >= gmax): BiCGStab from the last iterate.
+__global__ void k_ch_gersh(unsigned *gmax) {   // g = max over the system rows (identity rows: 0); float bits as unsigned
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    float g = 0;
+    if (i <= c.NX1 && j <= c.NY1 && INTERIOR) {
+        size_t k = ID(i, j);
+        float dg = fabsf((float)d.mat[0][k]);
+        float o = fabsf((float)d.mat[1][k]) + fabsf((float)d.mat[2][k]) + fabsf((float)d.mat[3][k]) + fabsf((float)d.mat[4][k]);
+        g = dg > 0 ? o / dg : 1e30f;
+    }
+    for (int q = 16; q > 0; q >>= 1) g = fmaxf(g, __shfl_down_sync(0xffffffff, g, q));
+    __shared__ float sg[32];
+    int lane = (threadIdx.y * blockDim.x + threadIdx.x) & 31, wid = (threadIdx.y * blockDim.x + threadIdx.x) >> 5;
+    if (lane == 0) sg[wid] = g;
+    __syncthreads();
+    int nw = (blockDim.x * blockDim.y + 31) / 32;
+    if (wid == 0) {
+        g = lane < nw ? sg[lane] : 0;
+        for (int q = 16; q > 0; q >>= 1) g = fmaxf(g, __shfl_down_sync(0xffffffff, g, q));
+        if (lane == 0) atomicMax(gmax, __float_as_uint(g));
+    }
+}
+__global__ void k_ch_bb(const real *x0) {      // (b,b) -> sc[8]; x0 = 0 outside the system rows
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    double bb = 0;
+    if (i <= c.NX1 && j <= c.NY1 && INTERIOR) { real b = d.rhs[ID(i, j)]; bb = (double)b * b; }
+    block_sum2(bb, 0, &d.sc[8], nullptr);
+}
+__global__ void k_ch_step(int n, const real *xn, const real *xm, real *xp, real a, real cc, double *rr, double tgt) {
+    if (n > 0 && rr[n - 1] < tgt) return;   // converged at an earlier iterate (skipped launches leave rr = 0)
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    double r2 = 0;
+    if (i <= c.NX1 && j <= c.NY1 && INTERIOR) {
+        size_t k = ID(i, j);
+        real x = xn[k];
+        real r = d.rhs[k] - Ax(xn, i, j);
+        xp[k] = x + a * (x - xm[k]) + cc * r / d.mat[0][k];
+        r2 = (double)r * r;
+    }
+    block_sum2(r2, 0, &rr[n], nullptr);
+}
+
+// ---- Fused BiCGStab (gpu_solver = 2): the same Jacobi right-preconditioned BiCGStab in 3 kernels per iteration
+// instead of 8. Neighbour values of p and s are formed on the fly (p and v ping-pong), so y = p/D, z = s/D and s are
+// never stored; the scalars of iteration n are computed by every thread from the inner products of slots n-1 and n
+// (S[8 n + q]: 0 (rhat,v), 1 (t,s), 2 (t,t), 3 (r,r), 4 (rhat,r); slot 0 holds (r0,r0), (rhat,r0)). A kernel returns
+// at once when an earlier iterate met the target (skipped slots stay 0, so later launches skip as well).
+struct FB { real *x, *r, *rh, *t, *pi, *po, *vi, *vo; double *S; double tgt; };
+__device__ __forceinline__ bool fb_in(int i, int j) { return i >= 2 && i <= c.nx && j >= c.ps_j0 && j <= c.ps_j1; }
+__device__ __forceinline__ void fb_nb(int i, int j, int &js, int &jn) {
+    js = j - 1; jn = j + 1;
+    if (c.cyclic) { if (j == c.ps_j0) js = c.ps_j1; if (j == c.ps_j1) jn = c.ps_j0; }
+}
+__device__ __forceinline__ void fb_scal(const double *S, int n, double &rho, double &alpha, double &omega) {
+    // rho_n = (rhat, r_{n-1}); alpha_n = rho_n / (rhat, v_n); omega_n = (t,s)_n / (t,t)_n
+    rho = S[8 * (n - 1) + 4];
+    double q0 = S[8 * n + 0], q2 = S[8 * n + 2];
+    alpha = q0 != 0 ? rho / q0 : 0;
+    omega = q2 > 0 ? S[8 * n + 1] / q2 : 0;
+}
+__global__ void k_fb1(FB f, int n) {      // p_n = r + beta (p - omega_{n-1} v); v_n = A (p_n / D); (rhat, v_n)
+    if (f.S[8 * (n - 1) + 3] < f.tgt) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    float a = 0;
+    __shared__ real sh[2];   // scalars once per block (fp64 division is slow on consumer GPUs)
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        real beta = 0, om = 0;
+        if (n > 1) {
+            double rhom, alm, omm;
+            fb_scal(f.S, n - 1, rhom, alm, omm);
+            double rho = f.S[8 * (n - 1) + 4];
+            beta = (real)((rho / rhom) * (alm / omm)); om = (real)omm;
+        }
+        sh[0] = beta; sh[1] = om;
+    }
+    __syncthreads();
+    if (i <= c.NX1 && j <= c.NY1 && INTERIOR) {
+        real beta = sh[0], om = sh[1];
+        int js, jn; fb_nb(i, j, js, jn);
+        auto q = [&](int ii, int jj) -> real {
+            if (!fb_in(ii, jj)) return 0;
+            size_t kk = ID(ii, jj);
+            return (f.r[kk] + beta * (f.pi[kk] - om * f.vi[kk])) / d.mat[0][kk];
+        };
+        size_t k = ID(i, j);
+        real pc = f.r[k] + beta * (f.pi[k] - om * f.vi[k]);
+        f.po[k] = pc;
+        real v = pc + d.mat[1][k] * q(i - 1, j) + d.mat[2][k] * q(i + 1, j) + d.mat[3][k] * q(i, js) + d.mat[4][k] * q(i, jn);
+        f.vo[k] = v; a = (float)f.rh[k] * (float)v;
+    }
+    block_sum2f(a, 0, &f.S[8 * n + 0], nullptr);
+}
+__global__ void k_fb2(FB f, int n) {      // s = r - alpha v_n; t = A (s / D); (t,s), (t,t)
+    if (f.S[8 * (n - 1) + 3] < f.tgt) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    float ts = 0, tt = 0;
+    __shared__ real sh[1];
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        double rho = f.S[8 * (n - 1) + 4], q0 = f.S[8 * n + 0];
+        sh[0] = (real)(q0 != 0 ? rho / q0 : 0);
+    }
+    __syncthreads();
+    if (i <= c.NX1 && j <= c.NY1 && INTERIOR) {
+        real al = sh[0];
+        int js, jn; fb_nb(i, j, js, jn);
+        auto z = [&](int ii, int jj) -> real {
+            if (!fb_in(ii, jj)) return 0;
+            size_t kk = ID(ii, jj);
+            return (f.r[kk] - al * f.vo[kk]) / d.mat[0][kk];
+        };
+        size_t k = ID(i, j);
+        real sc_ = f.r[k] - al * f.vo[k];
+        real t = sc_ + d.mat[1][k] * z(i - 1, j) + d.mat[2][k] * z(i + 1, j) + d.mat[3][k] * z(i, js) + d.mat[4][k] * z(i, jn);
+        f.t[k] = t; ts = (float)t * (float)sc_; tt = (float)t * (float)t;
+    }
+    block_sum2f(ts, tt, &f.S[8 * n + 1], &f.S[8 * n + 2]);
+}
+__global__ void k_fb3(FB f, int n) {      // x += (alpha p + omega s) / D; r = s - omega t; (r,r), (rhat,r)
+    if (f.S[8 * (n - 1) + 3] < f.tgt) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1, j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    float rr = 0, rhr = 0;
+    __shared__ real sh[2];
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        double rho, al, om; fb_scal(f.S, n, rho, al, om);
+        sh[0] = (real)al; sh[1] = (real)om;
+    }
+    __syncthreads();
+    if (i <= c.NX1 && j <= c.NY1 && INTERIOR) {
+        size_t k = ID(i, j);
+        real a = sh[0], o = sh[1];
+        real sc_ = f.r[k] - a * f.vo[k];
+        f.x[k] += (a * f.po[k] + o * sc_) / d.mat[0][k];
+        real r = sc_ - o * f.t[k];
+        f.r[k] = r; rr = (float)r * (float)r; rhr = (float)f.rh[k] * (float)r;
+    }
+    block_sum2f(rr, rhr, &f.S[8 * n + 3], &f.S[8 * n + 4]);
 }
 
 // ---- tri-diagonal system (1D): a = mat(2) (west), b = mat(1), cc = mat(3) (east), rhs, over i = 1..nx+1.
