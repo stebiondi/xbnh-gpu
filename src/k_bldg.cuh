@@ -36,6 +36,16 @@
 // not listed, or no file: no wind term). The peak of F_total over the storm is recorded with its time and its three
 // parts at that time (wave + drag, quasi-static, wind): the parts peak at different times, so their separate peaks
 // do not add up to the peak of the total.
+// Debris impact (bldg_debris = 1; recorded, not used for failure): a removed building becomes a debris source for the
+// standing buildings whose centroid lies within bldg_debris_r m (50) of its centroid, for bldg_debris_tw s (900) after
+// its removal. At every sample the impact force of one design debris piece on receiver b from source s is the ASCE 7
+// flood debris impact load (commentary C5.4.5, impulse-momentum with a half-sine pulse):
+//   F = pi W V_b C_I C_O C_D C_B R_max / (2 g dt)
+// W: bldg_debris_w (4448 N = 1,000 lb), dt: bldg_debris_dt (0.03 s), C_I C_O C_B R_max: bldg_debris_coef (0.8 =
+// orientation 0.8, the others 1), V_b: the flow speed toward b along the line from s to b, max(0, U . e_sb), at b's
+// perimeter cells, C_D: depth coefficient from the water height on the wall (0 at <= 1 ft, 1 at >= 5 ft, linear
+// between); the peak of C_D V_b over the perimeter. Recorded per building while it stands (bldg_impulse.txt, last
+// columns): the peak force over all its sources and the storm, kN, its time, and the number of sources so far.
 //
 // Buildings: 4-connected cells with the same threshold value (> 0). Standing: any cell raised more than 1 m
 // above bare earth in the current bed. Perimeter of b: the 4-neighbours of its cells that are not cells of b
@@ -100,8 +110,33 @@ __global__ void k_bldg_peaks(int nb, const int *ofs, const int *idx, const char 
     if (tot > pk2[4 * b]) { pk2[4 * b] = tot; pk2[4 * b + 1] = fwd; pk2[4 * b + 2] = fh; pk2[4 * b + 3] = fw; pt2[b] = tF; }
 }
 
+// debris impact: one thread per (source, receiver) pair; running peak of C_D V_b over the receiver's perimeter
+__global__ void k_bldg_debris(int np, const int *prec, const float *pex, const float *pey, const double *pend,
+                              const int *ofs, const int *idx, const char *stand, const int *pc, const real *zs,
+                              const real *u, const real *v, const float *zg, double t, double ts,
+                              float *pmax, double *ptm) {
+    int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= np) return;
+    int b = prec[q];
+    if (!stand[b] || t > pend[q]) return;
+    float best = 0.f, g0 = zg[b];
+    for (int r = ofs[b]; r < ofs[b + 1]; r++) {
+        int k = pc[idx[r]];
+        float hw = fmaxf((float)zs[k] - g0, 0.f);
+        float cd = fminf(fmaxf((hw - 0.3048f) / (1.524f - 0.3048f), 0.f), 1.f);   // depth coefficient, 1 ft -> 5 ft
+        float vb = fmaxf((float)(u[k] * pex[q] + v[k] * pey[q]), 0.f);
+        best = fmaxf(best, cd * vb);
+    }
+    if (best > pmax[q]) { pmax[q] = best; ptm[q] = ts; }
+}
+
 struct Buildings {
     bool on = false;
+    int debris = 0; double deb_r = 50, deb_tw = 900, deb_w = 4448.2, deb_dt = 0.03, deb_coef = 0.8, dxm = 1;
+    std::vector<int> prec, psrc; std::vector<float> pex, pey; std::vector<double> pend;   // pairs (host)
+    int np = 0, npcap = 0; int *d_prec = nullptr; float *d_pex = nullptr, *d_pey = nullptr, *d_pmax = nullptr;
+    double *d_pend = nullptr, *d_ptm = nullptr;
+    std::vector<double> cx, cy;                     // building centroids, grid cells
     int W = 241, fpos = 1;
     double tint = 0.5, tavg = 120, rho = 1025, g = 9.81, tnext = 0, wind_cf = 1.3, rhoa = 1.25;
     std::vector<double> wind_t, wind_s;             // wind speed series (set by the caller when wind is on)
@@ -136,6 +171,10 @@ struct Buildings {
         dump = F.integer("bldg_dump", 0); NX1_ = NX1; tcheck = F.dbl("bldg_tcheck", 0.0);
         wind_cf = F.dbl("bldg_wind_cf", 1.3); rhoa = F.dbl("bldg_rhoa", 1.25);
         std::string hf = F.name("bldg_heightfile");
+        debris = F.integer("bldg_debris", 0); deb_r = F.dbl("bldg_debris_r", 50.0); deb_tw = F.dbl("bldg_debris_tw", 900.0);
+        deb_w = F.dbl("bldg_debris_w", 4448.2); deb_dt = F.dbl("bldg_debris_dt", 0.03); deb_coef = F.dbl("bldg_debris_coef", 0.8);
+        if (debris && !(P.dx > 0 && fabs(P.dx - P.dy) < 1e-9 * P.dx)) fail("bldg_debris needs a uniform square grid (dx = dy)");
+        dxm = P.dx;
         W = (int)lround(tavg / tint) + 1; if (W % 2 == 0) W++;
         const size_t N = (size_t)NX1 * NY1;
         std::vector<double> th; read_grid_file(tf, NX1, NY1, th, true);
@@ -183,6 +222,11 @@ struct Buildings {
             per[b] = mine;
         }
         npc = (int)pc.size();
+        cx.assign(nb, 0); cy.assign(nb, 0);
+        for (int b = 0; b < nb; b++) {
+            for (int k : cells[b]) { cx[b] += k % NX1; cy[b] += k / NX1; }
+            cx[b] /= cells[b].size(); cy[b] /= cells[b].size();
+        }
         standing.assign(nb, 0); Jcum.assign(nb, 0);
         for (int b = 0; b < nb; b++) for (int k : cells[b]) if (zb[k] > bare[k] + 1.0) { standing[b] = 1; break; }
         CK(cudaMalloc(&d_pc, npc * sizeof(int))); CK(cudaMemcpy(d_pc, pc.data(), npc * sizeof(int), cudaMemcpyHostToDevice));
@@ -222,6 +266,8 @@ struct Buildings {
         int ns0 = 0; for (char s : standing) ns0 += s;
         printf("buildings: %d (%d standing), %d perimeter cells, window %d samples x %.2f s, state %s; heights for the wind term %d\n",
                nb, ns0, npc, W, tint, resumed ? ("resumed from " + statefile + ", sample " + std::to_string(ns)).c_str() : "new", nH);
+        if (debris) printf("buildings: debris impact on, radius %.0f m, window %.0f s, W %.0f N, dt %.3f s, coef %.2f, %d source-receiver pairs\n",
+                           deb_r, deb_tw, deb_w, deb_dt, deb_coef, np);
         fflush(stdout);
         tnext = tint; tnextcheck = tcheck;
     }
@@ -238,9 +284,45 @@ struct Buildings {
             k_bldg_peaks<<<(nb + 127) / 128, 128>>>(nb, d_ofs, d_idx, d_st, d_hb, d_Fc, d_m2, d_pc, zs, zb, d_zg, d_pk, d_pt,
                                                     ts - (W - 1) / 2 * tint, ts, ns >= W - 1 ? 1 : 0, d_hcc, d_m2c, d_H, rho,
                                                     0.5 * rho * g, 0.5 * rhoa * wind_cf * V * V, d_pk2, d_pt2);
+            if (np > 0)
+                k_bldg_debris<<<(np + 127) / 128, 128>>>(np, d_prec, d_pex, d_pey, d_pend, d_ofs, d_idx, d_st, d_pc, zs, u, v,
+                                                         d_zg, ts, ts, d_pmax, d_ptm);
             ns++; tnext += tint;
         }
     }
+
+    // device copies of the pair arrays (np pairs; the per-pair peaks of new pairs start at 0)
+    void push_pairs(int from) {
+        if (np > npcap) {
+            int cap = std::max(np, 2 * npcap + 1024);
+            std::vector<float> pm(cap, 0.f); std::vector<double> tm(cap, 0.0);
+            if (npcap) { CK(cudaMemcpy(pm.data(), d_pmax, from * sizeof(float), cudaMemcpyDeviceToHost));
+                         CK(cudaMemcpy(tm.data(), d_ptm, from * sizeof(double), cudaMemcpyDeviceToHost)); }
+            for (void *a : {(void *)d_prec, (void *)d_pex, (void *)d_pey, (void *)d_pend, (void *)d_pmax, (void *)d_ptm}) if (a) CK(cudaFree(a));
+            CK(cudaMalloc(&d_prec, cap * sizeof(int))); CK(cudaMalloc(&d_pex, cap * sizeof(float))); CK(cudaMalloc(&d_pey, cap * sizeof(float)));
+            CK(cudaMalloc(&d_pend, cap * sizeof(double))); CK(cudaMalloc(&d_pmax, cap * sizeof(float))); CK(cudaMalloc(&d_ptm, cap * sizeof(double)));
+            CK(cudaMemcpy(d_pmax, pm.data(), cap * sizeof(float), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_ptm, tm.data(), cap * sizeof(double), cudaMemcpyHostToDevice));
+            npcap = cap; from = 0;
+        }
+        int n = np - from; if (n <= 0) return;
+        CK(cudaMemcpy(d_prec + from, prec.data() + from, n * sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_pex + from, pex.data() + from, n * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_pey + from, pey.data() + from, n * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_pend + from, pend.data() + from, n * sizeof(double), cudaMemcpyHostToDevice));
+    }
+    // a removed building s: pairs with the standing buildings within deb_r (storm time ts)
+    void add_source(int s, double ts) {
+        for (int b = 0; b < nb; b++) {
+            if (!standing[b] || b == s) continue;
+            double dx = (cx[b] - cx[s]) * dxm, dy = (cy[b] - cy[s]) * dxm, d = std::hypot(dx, dy);
+            if (d > deb_r || d <= 0) continue;
+            prec.push_back(b); psrc.push_back(s); pex.push_back((float)(dx / d)); pey.push_back((float)(dy / d));
+            pend.push_back(ts + deb_tw);
+        }
+        np = (int)prec.size();
+    }
+    double deb_force(float cdvb) const { return M_PI * deb_w * cdvb * deb_coef / (2 * g * deb_dt); }   // N
 
     // check: add this interval's perimeter-maximum impulse, remove failed buildings in zb/zs (device), write state
     template <class D2HF, class H2DF>
@@ -275,6 +357,7 @@ struct Buildings {
             }
             h2d(d_zs, zs); h2d(d_zb, zb); changed = true;
             CK(cudaMemcpy(d_st, standing.data(), nb, cudaMemcpyHostToDevice));
+            if (debris) { int from = np; for (int b : gone) add_source(b, ns * tint); push_pairs(from); }
         }
         if (!gone.empty()) {
             FILE *g = fopen("bldg_removed.txt", "a");
@@ -297,17 +380,27 @@ struct Buildings {
         CK(cudaMemcpy(pk.data(), d_pk, 3 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(pt.data(), d_pt, 3 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         fprintf(f, "%% id i j threshold_kNhr_m impulse_kNhr_m standing ncells | peaks while standing, kN/m, and storm time s:"
-                   " wave_F t drag_Cd2 t dhydrostatic t | total lateral load at one instant, kN/m: F_total t wave+drag quasistatic wind\n");
+                   " wave_F t drag_Cd2 t dhydrostatic t | total lateral load at one instant, kN/m: F_total t wave+drag quasistatic wind%s\n",
+                debris ? " | debris impact (ASCE 7 C5.4.5), kN: F_debris t n_sources" : "");
         std::vector<double> pk2(4 * nb), pt2(nb);
         CK(cudaMemcpy(pk2.data(), d_pk2, 4 * nb * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(pt2.data(), d_pt2, nb * sizeof(double), cudaMemcpyDeviceToHost));
+        std::vector<float> dmax(nb, 0.f); std::vector<double> dt_(nb, 0.0); std::vector<int> dn(nb, 0);
+        if (debris && np > 0) {
+            std::vector<float> pm(np); std::vector<double> tm(np);
+            CK(cudaMemcpy(pm.data(), d_pmax, np * sizeof(float), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(tm.data(), d_ptm, np * sizeof(double), cudaMemcpyDeviceToHost));
+            for (int q = 0; q < np; q++) { int b = prec[q]; dn[b]++; if (pm[q] > dmax[b]) { dmax[b] = pm[q]; dt_[b] = tm[q]; } }
+        }
         for (int b = 0; b < nb; b++) {
             const double *q = &pk2[4 * b]; bool ok = q[0] > -1e299;   // never evaluated: 0
-            fprintf(f, "%6d %5d %5d %6.1f %12.5f %d %6zu %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f %9.3f %9.3f %9.3f\n",
+            fprintf(f, "%6d %5d %5d %6.1f %12.5f %d %6zu %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f %9.3f %9.1f %9.3f %9.3f %9.3f",
                     b + 1, ic[b], jc[b], thr[b] / 3.6e6, Jcum[b] / 3.6e6, standing[b], cells[b].size(),
                     pk[3 * b] / 1e3, pt[3 * b], rho * pk[3 * b + 1] / 1e3, pt[3 * b + 1],
                     0.5 * rho * g * pk[3 * b + 2] / 1e3, pt[3 * b + 2],
                     ok ? q[0] / 1e3 : 0.0, pt2[b], ok ? q[1] / 1e3 : 0.0, ok ? q[2] / 1e3 : 0.0, ok ? q[3] / 1e3 : 0.0);
+            if (debris) fprintf(f, " %9.3f %9.1f %4d", deb_force(dmax[b]) / 1e3, dt_[b], dn[b]);
+            fprintf(f, "\n");
         }
         fclose(f);
     }
@@ -332,6 +425,16 @@ struct Buildings {
             CK(cudaMemcpy(rU.data(), d_ringU, rU.size() * sizeof(float), cudaMemcpyDeviceToHost));
             o.write((char *)pk2.data(), 4 * nb * sizeof(double)); o.write((char *)pt2.data(), nb * sizeof(double));
             o.write((char *)rU.data(), rU.size() * sizeof(float)); }
+        if (debris) {   // debris pairs and their peaks
+            std::vector<float> pm(np); std::vector<double> tm(np);
+            if (np) { CK(cudaMemcpy(pm.data(), d_pmax, np * sizeof(float), cudaMemcpyDeviceToHost));
+                      CK(cudaMemcpy(tm.data(), d_ptm, np * sizeof(double), cudaMemcpyDeviceToHost)); }
+            o.write((char *)&np, sizeof(np));
+            o.write((char *)prec.data(), np * sizeof(int)); o.write((char *)psrc.data(), np * sizeof(int));
+            o.write((char *)pex.data(), np * sizeof(float)); o.write((char *)pey.data(), np * sizeof(float));
+            o.write((char *)pend.data(), np * sizeof(double));
+            o.write((char *)pm.data(), np * sizeof(float)); o.write((char *)tm.data(), np * sizeof(double));
+        }
         o.close();
         std::rename(tmp.c_str(), statefile.c_str());
     }
@@ -356,6 +459,21 @@ struct Buildings {
                 CK(cudaMemcpy(d_pt2, pt2.data(), nb * sizeof(double), cudaMemcpyHostToDevice));
                 CK(cudaMemcpy(d_ringU, rU.data(), rU.size() * sizeof(float), cudaMemcpyHostToDevice));
             } else printf("buildings: %s has no total-load state (older run): total load starts here\n", statefile.c_str());
+        }
+        if (debris) {
+            int n = 0;
+            if (f.read((char *)&n, sizeof(n)) && n >= 0) {
+                prec.resize(n); psrc.resize(n); pex.resize(n); pey.resize(n); pend.resize(n);
+                std::vector<float> pm(n); std::vector<double> tm(n);
+                f.read((char *)prec.data(), n * sizeof(int)); f.read((char *)psrc.data(), n * sizeof(int));
+                f.read((char *)pex.data(), n * sizeof(float)); f.read((char *)pey.data(), n * sizeof(float));
+                f.read((char *)pend.data(), n * sizeof(double));
+                f.read((char *)pm.data(), n * sizeof(float)); f.read((char *)tm.data(), n * sizeof(double));
+                if (!f) fail(statefile + ": debris section truncated");
+                np = n; push_pairs(0);
+                if (np) { CK(cudaMemcpy(d_pmax, pm.data(), np * sizeof(float), cudaMemcpyHostToDevice));
+                          CK(cudaMemcpy(d_ptm, tm.data(), np * sizeof(double), cudaMemcpyHostToDevice)); }
+            } else printf("buildings: %s has no debris state: debris impact starts here (earlier removals are not sources)\n", statefile.c_str());
         }
         CK(cudaMemcpy(d_pk, pk.data(), 3 * nb * sizeof(double), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_pt, pt.data(), 3 * nb * sizeof(double), cudaMemcpyHostToDevice));
